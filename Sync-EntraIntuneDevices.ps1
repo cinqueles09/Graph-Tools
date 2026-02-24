@@ -657,6 +657,57 @@ else {
     }
 }
 
+# ==============================================================================
+# CREACION AUTOMATICA DEL README EN LA CARPETA DE EXPORTACION
+# ==============================================================================
+
+$ReadmeContent = @"
+README - Descripcion de ficheros CSV
+
+Los ficheros contenidos en esta carpeta tienen el siguiente significado:
+
+- Coincidentes
+Dispositivos que tienen objeto tanto en Entra ID como en Intune.
+No implica que los objetos esten correctamente configurados; solo que existen en ambas plataformas.
+
+- Dispositivos Duplicados Intune
+Dispositivos con mas de un objeto asociado al mismo numero de serie en Intune.
+El CSV muestra los que seran eliminados por duplicidad.
+
+- Dispositivos Inactivos Intune
+Dispositivos inactivos en Intune segun la fecha indicada durante la ejecucion del script.
+
+- Dispositivos Inactivos solo Entra ID
+Dispositivos inactivos en Entra ID segun la fecha indicada y que no existen en Intune.
+
+- Dispositivo MDM Office365Mobile
+Dispositivos registrados con MDM Office365Mobile.
+Requieren revision manual de licencia si estan activos.
+
+- TrustType - Registered MDM
+Dispositivos Registered inscritos en MDM.
+Requieren cambio de tipo de inscripcion.
+
+- TrustType Workplace
+Dispositivos Windows Registered que no estan en Intune.
+Requieren revision por posible registro personal.
+
+- Solo Azure AD
+Dispositivos existentes unicamente en Azure AD. Informativo.
+
+- Solo Intune
+Dispositivos existentes unicamente en Intune. Informativo.
+
+Fecha de generacion: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+Fecha limite analizada: $($fechaLimite.ToString("yyyy-MM-dd"))
+Version Script: 5.5
+"@
+
+$ReadmePath = Join-Path $basePath "README.txt"
+
+$ReadmeContent | Out-File -FilePath $ReadmePath -Encoding UTF8 -Force
+
+Write-Host "`n[OK] README generado correctamente en: $ReadmePath" -ForegroundColor Green
 Write-Host "`n================================================================" -ForegroundColor Cyan
 Write-Host "         FIN DEL SCRIPT DE MANTENIMIENTO" -ForegroundColor White
 Write-Host "================================================================" -ForegroundColor Cyan
