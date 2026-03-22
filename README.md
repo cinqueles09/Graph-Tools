@@ -21,13 +21,13 @@ Administrar el ecosistema de Microsoft mediante peticiones manuales o scripts di
 
 ## 🛠️ Scripts Disponibles
 
-### 🔄 [Sync-EntraIntuneDevices.ps1](./wiki/Sync)
+### 🔄 [Sync-EntraIntuneDevices.ps1]
 **Core de gestión de inventario.**
 * **Higiene:** Sincronización inteligente entre Intune y Entra ID.
 * **Limpieza:** Borrado automático con confirmación por inactividad y gestión de registros huérfanos.
 * **Auditoría:** Generación automática de reportes CSV pre-ejecución.
 
-### 🧹 [Intune_Duplicate_Cleanup.ps1](./wiki/Intune-Duplicate-Cleanup)
+### 🧹 [Intune_Duplicate_Cleanup.ps1](https://github.com/cinqueles09/Graph-Tools/wiki/Intune-Duplicate-Cleanup)
 **Especialista en duplicados.**
 * **Precisión:** Identificación por Número de Serie y `lastSyncDateTime`.
 * **Seguridad:** Sistema de confirmación manual antes de cada borrado permanente.
