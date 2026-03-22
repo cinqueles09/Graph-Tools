@@ -42,5 +42,6 @@ Actualmente estamos trabajando en las siguientes funcionalidades para ampliar la
 - [ ] **Etiquetado Dinámico de Dispositivos:** Asignación automática de etiquetas (tags) en Intune/Entra ID basada en atributos específicos (SO, Departamento, Ubicación).
 - [ ] **Módulo de Auditoría de Licencias:** Reportes detallados de uso y optimización de costes en Office 365.
 - [ ] **Automatización de exportación CSV para Assessment de Intune:** Generación de informes detallados y estructurados para realizar auditorías de cumplimiento y estado de la configuración de Intune.
+- [ ] **Engine de Reporting HTML**: Motor de generación de informes interactivos (filtros, búsqueda y gráficas) para el análisis de cumplimiento de dispositivos en el ecosistema M365.
 
 ---
