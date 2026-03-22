@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 ![Maintenance](https://img.shields.io/badge/Maintained%3F-yes-brightgreen?style=for-the-badge)
 
-**Graph-tools** es una colección de automatizaciones inteligentes diseñadas para simplificar las tareas de administración del día a día en el entorno de Microsoft 365. Desde la gestión de usuarios hasta la auditoría de seguridad, esta herramienta busca ser el aliado definitivo para administradores de sistemas y DevOps.
+**Graph-tools** es una colección de automatizaciones inteligentes diseñadas para simplificar las tareas de administración del día a día en el entorno de Microsoft 365. Desde la gestión de usuarios hasta la auditoría de seguridad, esta herramienta busca ser el aliado definitivo para administradores de sistemas.
 
 [**📖 Leer la Wiki de documentación**](https://github.com/cinqueles09/Graph-Tools/wiki) | [**🚩 Reportar un error**](https://github.com/cinqueles09/Graph-Tools/issues)
 
