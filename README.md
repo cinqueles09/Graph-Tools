@@ -21,7 +21,7 @@ Administrar el ecosistema de Microsoft mediante peticiones manuales o scripts di
 
 ## 🛠️ Scripts Disponibles
 
-### 🔄 [Sync-EntraIntuneDevices.ps1]
+### 🔄 [Sync-EntraIntuneDevices.ps1](https://github.com/cinqueles09/Graph-Tools/wiki/Sync-EntraIntuneDevices)
 **Core de gestión de inventario.**
 * **Higiene:** Sincronización inteligente entre Intune y Entra ID.
 * **Limpieza:** Borrado automático con confirmación por inactividad y gestión de registros huérfanos.
