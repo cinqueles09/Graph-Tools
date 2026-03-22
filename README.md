@@ -27,7 +27,7 @@ Administrar el ecosistema de Microsoft mediante peticiones manuales o scripts di
 * **Limpieza:** Borrado automático con confirmación por inactividad y gestión de registros huérfanos.
 * **Auditoría:** Generación automática de reportes CSV pre-ejecución.
 
-### 🧹 [Intune_Duplicate_Cleanup.ps1](./wiki/Cleanup)
+### 🧹 [Intune_Duplicate_Cleanup.ps1](./wiki/Intune-Duplicate-Cleanup)
 **Especialista en duplicados.**
 * **Precisión:** Identificación por Número de Serie y `lastSyncDateTime`.
 * **Seguridad:** Sistema de confirmación manual antes de cada borrado permanente.
