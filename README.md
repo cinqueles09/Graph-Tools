@@ -24,7 +24,7 @@ Administrar el ecosistema de Microsoft mediante peticiones manuales o scripts di
 ### 🔄 [Sync-EntraIntuneDevices.ps1](./wiki/Sync)
 **Core de gestión de inventario.**
 * **Higiene:** Sincronización inteligente entre Intune y Entra ID.
-* **Limpieza:** Borrado automático por inactividad y gestión de registros huérfanos.
+* **Limpieza:** Borrado automático con confirmación por inactividad y gestión de registros huérfanos.
 * **Auditoría:** Generación automática de reportes CSV pre-ejecución.
 
 ### 🧹 [Intune_Duplicate_Cleanup.ps1](./wiki/Cleanup)
