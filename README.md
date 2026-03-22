@@ -24,12 +24,35 @@ Administrar el ecosistema de Microsoft mediante peticiones manuales o scripts di
 ### 1. 📂 **Sync-EntraIntuneDevices.ps1**
 Este script es el núcleo actual de la herramienta. Conecta con la **Microsoft Graph API** para automatizar la higiene y el mantenimiento del inventario de dispositivos, realizando las siguientes tareas:
 
-* **🔍 Cruce de Inventarios:** Sincronización inteligente de activos entre **Microsoft Intune** y **Microsoft Entra ID**.
-* **🧹 Limpieza por Inactividad:** Identificación y borrado automático de dispositivos basados en su última fecha de inicio de sesión o contacto.
+* **🔍 Cruce de inventarios:** Sincronización inteligente de activos entre **Microsoft Intune** y **Microsoft Entra ID**.
+* **🧹 Limpieza por inactividad:** Identificación y borrado automático de dispositivos basados en su última fecha de inicio de sesión o contacto.
 * **👻 Gestión de "Huérfanos":** Detección de dispositivos sin propietario y limpieza de registros de tipo *Workplace Join* obsoletos.
-* **👯 Control de Duplicados:** Eliminación de registros redundantes en Intune mediante la validación única del **Número de Serie**.
-* **📊 Reporting Automático:** Generación de reportes detallados en formato **CSV** antes de cada ejecución para garantizar la trazabilidad de los cambios.
+* **👯 Control de duplicados:** Eliminación de registros redundantes en Intune mediante la validación única del **Número de Serie**.
+* **📊 Reporting automático:** Generación de reportes detallados en formato **CSV** antes de cada ejecución para garantizar la trazabilidad de los cambios.
 
+#### 🔐 Permisos de API Requeridos
+Para la ejecución de este script, la aplicación registrada debe tener asignados y consentidos los siguientes permisos de tipo **Aplicación**:
+
+| API | Permiso | Motivo | Tipo |
+| :--- | :--- | :--- | :--- |
+| **Microsoft Graph** | `DeviceManagementManagedDevices.ReadWrite.All` | Lectura, gestión y eliminación de dispositivos en **Microsoft Intune**. | Aplicación |
+| **Microsoft Graph** | `Device.ReadWrite.All` | Lectura, modificación y eliminación de objetos de dispositivo en **Entra ID**. | Aplicación |
+
+### 2. 📂 **Intune_Duplicate_Cleanup.ps1**
+Este script especializado automatiza la higiene del inventario en **Microsoft Intune**, eliminando la redundancia de registros y garantizando la integridad de los datos del tenant. Realiza las siguientes tareas:
+
+* **🔍 Validación por hardware:** Identificación precisa de duplicados mediante el cruce del **número de serie** único de cada dispositivo.
+* **🧠 Selección inteligente:** Análisis comparativo de la propiedad `lastSyncDateTime` para preservar siempre el registro con la sincronización más reciente.
+* **🛡️ Borrado controlado:** Implementación de un sistema de **confirmación individual** para evitar eliminaciones accidentales y garantizar la supervisión humana.
+* **⚡ Optimización de API:** Gestión eficiente de inventarios extensos mediante **paginación automática** de resultados de Microsoft Graph.
+* **🔐 Conexión segura:** Autenticación profesional mediante **Service Principal** (App Registration) con entrada de secretos protegida.
+
+#### 🔐 Permisos de API Requeridos
+Para la ejecución de este script, la aplicación registrada debe tener asignados y consentidos los siguientes permisos de tipo **Aplicación**:
+
+| API | Permiso | Motivo | Tipo |
+| :--- | :--- | :--- | :--- |
+| **Microsoft Graph** | `DeviceManagementManagedDevices.ReadWrite.All` | Lectura, gestión y eliminación de dispositivos en **Microsoft Intune**. | Aplicación |
 ---
 
 *(Próximamente se añadirán más utilidades según el Roadmap con su correspondiente apartado en la wiki).*
@@ -38,6 +61,7 @@ Este script es el núcleo actual de la herramienta. Conecta con la **Microsoft G
 
 Actualmente estamos trabajando en las siguientes funcionalidades para ampliar la "navaja suiza":
 
+- [x] **Limpieza de dispositivos duplicados en Intune:** Análisis de dispositivos inscritos en intune para identificar los duplicados y poderlos higienizar.
 - [ ] **Sincronización de GAL a Contactos:** Automatización para exportar e hidratar la Global Address List (GAL) directamente en los contactos de Outlook de los usuarios.
 - [ ] **Etiquetado Dinámico de Dispositivos:** Asignación automática de etiquetas (tags) en Intune/Entra ID basada en atributos específicos (SO, Departamento, Ubicación).
 - [ ] **Módulo de Auditoría de Licencias:** Reportes detallados de uso y optimización de costes en Office 365.
