@@ -106,6 +106,8 @@ $clientId     = Read-Host "  Client ID (Application)"
 $clientSecret = Read-Host "  Client Secret" -AsSecureString
 
 $nombreCliente = Read-Host "  Nombre del Cliente"
+$autorInforme  = "Ismael Morilla Orellana "
+$anioCreacion  = "Abril - 2026"
 $logoCliente   = Read-Host "  URL Logo Cliente (Enter para logo generico)"
 if ([string]::IsNullOrWhiteSpace($logoCliente)) {
     $logoCliente = "https://upload.wikimedia.org/wikipedia/commons/thumb/4/44/Microsoft_logo.svg/200px-Microsoft_logo.svg.png"
@@ -137,6 +139,15 @@ try {
 catch {
     Write-Host "  [-] Error de autenticacion: $($_.Exception.Message)" -ForegroundColor Red
     exit 1
+}
+
+# ==============================
+# FUNCIONES UTILITARIAS (deben definirse antes de usarse)
+# ==============================
+function NullSafe {
+    param($Value, $Default = "")
+    if ($null -eq $Value) { return $Default }
+    return [string]$Value
 }
 
 # ==============================
@@ -177,11 +188,11 @@ Write-Host ""
 Write-Host "  Obteniendo datos de Microsoft Graph..." -ForegroundColor Yellow
 
 # Intune Devices
-$intuneUri = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$select=id,deviceName,userPrincipalName,operatingSystem,osVersion,complianceState,model,manufacturer,serialNumber,lastSyncDateTime,enrolledDateTime,managementAgent"
+$intuneUri = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$select=id,deviceName,userPrincipalName,operatingSystem,osVersion,complianceState,model,manufacturer,serialNumber,lastSyncDateTime,enrolledDateTime,managementAgent,managedDeviceOwnerType"
 $intuneDevices = Get-GraphPagedData -Uri $intuneUri -Headers $headers -Label "Dispositivos Intune"
 
 # Entra Devices
-$entraUri = "https://graph.microsoft.com/v1.0/devices?`$select=displayName,operatingSystem,operatingSystemVersion,isCompliant,isManaged,trustType,approximateLastSignInDateTime"
+$entraUri = "https://graph.microsoft.com/v1.0/devices?`$select=displayName,operatingSystem,operatingSystemVersion,isCompliant,isManaged,trustType,approximateLastSignInDateTime,mdmAppId,managementType,registrationDateTime,deviceId"
 $entraDevices = Get-GraphPagedData -Uri $entraUri -Headers $headers -Label "Dispositivos Entra ID"
 
 # Risky Users
@@ -202,6 +213,148 @@ try {
 } catch {
     Write-Host "  ! Acceso Condicional: Sin acceso suficiente para leer politicas" -ForegroundColor DarkYellow
 }
+
+# Compliance Policies (directivas de cumplimiento)
+$compliancePolicies = @()
+try {
+    $cpUri = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies?`$select=id,displayName,lastModifiedDateTime"
+    $compliancePolicies = Get-GraphPagedData -Uri $cpUri -Headers $headers -Label "Directivas de cumplimiento"
+} catch {
+    Write-Host "  ! Compliance Policies: Sin acceso (requiere DeviceManagementConfiguration.Read)" -ForegroundColor DarkYellow
+}
+
+# Por cada politica: overview de estados + lista de dispositivos no conformes con settings
+$compliancePolicyData = @()
+foreach ($pol in $compliancePolicies) {
+    $polId = $pol.id
+    $polName = $pol.displayName
+    $odataType = $pol.'@odata.type' -replace '#microsoft.graph.',''
+
+    # Plataforma inferida del tipo OData (1er intento)
+    $platform = switch -Wildcard ($odataType) {
+        'windows10CompliancePolicy'         { 'Windows' }
+        'windows10MobileCompliancePolicy'   { 'Windows Mobile' }
+        'windows81CompliancePolicy'         { 'Windows 8.1' }
+        'androidCompliancePolicy'           { 'Android' }
+        'androidWorkProfileCompliancePolicy'{ 'Android Enterprise' }
+        'androidDeviceOwnerCompliancePolicy'{ 'Android Enterprise' }
+        'iosCompliancePolicy'               { 'iOS' }
+        'macOSCompliancePolicy'             { 'macOS' }
+        default                             { '' }
+    }
+
+    # 2do intento: inferir plataforma desde el displayName si @odata.type estaba ausente
+    if ([string]::IsNullOrWhiteSpace($platform)) {
+        $dn = $polName.ToLower()
+        $platform = if     ($dn -match 'windows|w10|w11|win')       { 'Windows' }
+                    elseif ($dn -match 'android|byod|cope|work.prof') { 'Android Enterprise' }
+                    elseif ($dn -match 'ios|iphone|ipad')            { 'iOS' }
+                    elseif ($dn -match 'mac|macos|apple')            { 'macOS' }
+                    else                                             { 'Otro' }
+    }
+
+    # Overview (totales conformes/no conformes/error/etc.)
+    $overview = $null
+    try {
+        $ovUri = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$polId/deviceStatusOverview"
+        $overview = Invoke-RestMethod -Uri $ovUri -Headers $headers -Method Get -ErrorAction Stop
+    } catch {}
+
+    # Si el overview devuelve todo a 0, usar deviceStatuses SIN $filter ni $select (evita 500)
+    $ovTotal = 0
+    if ($null -ne $overview) {
+        $ovTotal = [int]($overview.compliantDeviceCount) + [int]($overview.nonCompliantDeviceCount) +
+                   [int]($overview.errorDeviceCount)     + [int]($overview.unknownDeviceCount)      +
+                   [int]($overview.inGracePeriodCount)   + [int]($overview.configManagerCount)
+    }
+    $allStatuses = @()
+    if ($ovTotal -eq 0) {
+        try {
+            # Sin $filter ni $select — algunos tenants devuelven 500 con cualquier query param
+            $allStatusUri = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$polId/deviceStatuses"
+            $allStatuses  = Get-GraphPagedData -Uri $allStatusUri -Headers $headers -Label "  -> Estados fallback: $polName"
+            if ($allStatuses.Count -gt 0) {
+                $overview = [PSCustomObject]@{
+                    compliantDeviceCount    = @($allStatuses | Where-Object { $_.status -eq 'compliant'     }).Count
+                    nonCompliantDeviceCount = @($allStatuses | Where-Object { $_.status -eq 'noncompliant'  }).Count
+                    errorDeviceCount        = @($allStatuses | Where-Object { $_.status -eq 'error'         }).Count
+                    unknownDeviceCount      = @($allStatuses | Where-Object { $_.status -eq 'unknown'       }).Count
+                    inGracePeriodCount      = @($allStatuses | Where-Object { $_.status -eq 'inGracePeriod' }).Count
+                    configManagerCount      = 0
+                }
+            }
+        } catch {
+            Write-Host "    ! deviceStatuses no disponible para: $polName" -ForegroundColor DarkYellow
+        }
+    }
+
+    # Dispositivos no conformes: filtrar localmente desde $allStatuses si ya los tenemos,
+    # o hacer llamada separada sin $filter (evita 500 en tenants con restricciones)
+    $nonCompliantDevices = @()
+    try {
+        if ($allStatuses.Count -gt 0) {
+            # Reutilizar los datos ya descargados, filtrar en PS
+            $nonCompliantDevices = @($allStatuses | Where-Object {
+                $_.status -ne 'compliant' -and $_.status -ne 'notApplicable'
+            })
+        } else {
+            # Descarga fresca sin $filter — luego filtramos aquí
+            $dsUri = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$polId/deviceStatuses"
+            $allDs = Get-GraphPagedData -Uri $dsUri -Headers $headers -Label "  -> No conformes: $polName"
+            $nonCompliantDevices = @($allDs | Where-Object {
+                $_.status -ne 'compliant' -and $_.status -ne 'notApplicable'
+            })
+        }
+    } catch {
+        Write-Host "    ! No conformes no disponible para: $polName" -ForegroundColor DarkYellow
+    }
+
+    # Settings no conformes vía deviceSettingStateSummaries
+    $settingSummaries = @()
+    try {
+        $ssUri = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$polId/deviceSettingStateSummaries"
+        $settingSummaries = Get-GraphPagedData -Uri $ssUri -Headers $headers -Label "  -> Settings: $polName"
+    } catch {}
+
+    # Calcular totales desde settingStateSummaries (fuente más fiable — siempre funciona)
+    # Nota: estos son contadores por SETTING, no por dispositivo, pero son el mejor dato disponible
+    $settingsCompliant    = [int](($settingSummaries | Measure-Object -Property compliantDeviceCount    -Sum).Sum)
+    $settingsNonCompliant = [int](($settingSummaries | Measure-Object -Property nonCompliantDeviceCount -Sum).Sum)
+    $settingsError        = [int](($settingSummaries | Measure-Object -Property errorDeviceCount        -Sum).Sum)
+
+    # Fuente de contadores (prioridad: overview > deviceStatuses > settingSummaries)
+    $hasOverview = ($null -ne $overview) -and (([int]($overview.compliantDeviceCount) + [int]($overview.nonCompliantDeviceCount)) -gt 0)
+
+    $finalCompliant    = if ($hasOverview) { [int]($overview.compliantDeviceCount)    }
+                         elseif ($settingsCompliant    -gt 0) { $settingsCompliant    } else { 0 }
+    $finalNonCompliant = if ($hasOverview) { [int]($overview.nonCompliantDeviceCount) }
+                         elseif ($settingsNonCompliant -gt 0) { $settingsNonCompliant } else { 0 }
+    $finalError        = if ($hasOverview) { [int]($overview.errorDeviceCount)        }
+                         elseif ($settingsError        -gt 0) { $settingsError        } else { 0 }
+    $finalUnknown      = if ($hasOverview) { [int]($overview.unknownDeviceCount)     } else { 0 }
+    $finalGrace        = if ($hasOverview) { [int]($overview.inGracePeriodCount)     } else { 0 }
+    $finalConfig       = if ($hasOverview) { [int]($overview.configManagerCount)     } else { 0 }
+
+    $dataSource = if ($hasOverview) { 'overview' } elseif ($settingsCompliant + $settingsNonCompliant -gt 0) { 'settings' } else { 'none' }
+    Write-Host ("    [{0}] C:{1} NC:{2} Err:{3}  (fuente: {4})" -f $polName, $finalCompliant, $finalNonCompliant, $finalError, $dataSource) -ForegroundColor DarkGray
+
+    $compliancePolicyData += [PSCustomObject]@{
+        id                 = $polId
+        displayName        = $polName
+        platform           = $platform
+        odataType          = $odataType
+        lastModified       = NullSafe $pol.lastModifiedDateTime
+        compliantCount     = $finalCompliant
+        nonCompliantCount  = $finalNonCompliant
+        errorCount         = $finalError
+        unknownCount       = $finalUnknown
+        gracePeriodCount   = $finalGrace
+        configManagerCount = $finalConfig
+        nonCompliantDevices= $nonCompliantDevices
+        settingSummaries   = $settingSummaries
+    }
+}
+Write-Host "  -> Compliance: $($compliancePolicies.Count) politicas procesadas" -ForegroundColor Gray
 
 # MFA Registration (requiere Reports.Read.All)
 $mfaRegistered = 0
@@ -265,6 +418,14 @@ $compGlobal  = if ($cntTotal -gt 0) {
     [math]::Round((($allIntune | Where-Object {$_.complianceState -eq "compliant"}).Count / $cntTotal) * 100) 
 } else { 0 }
 
+# Tipo de Propiedad
+$cntCorporate = @($allIntune | Where-Object { $_.managedDeviceOwnerType -eq "company" }).Count
+$cntPersonal  = @($allIntune | Where-Object { $_.managedDeviceOwnerType -eq "personal" }).Count
+$cntOwnerUnknown = $cntTotal - $cntCorporate - $cntPersonal
+$pctCorporate = if ($cntTotal -gt 0) { [math]::Round(($cntCorporate / $cntTotal) * 100) } else { 0 }
+$pctPersonal  = if ($cntTotal -gt 0) { [math]::Round(($cntPersonal  / $cntTotal) * 100) } else { 0 }
+$pctOwnerUnknown = if ($cntTotal -gt 0) { [math]::Round(($cntOwnerUnknown / $cntTotal) * 100) } else { 0 }
+
 # Entra ID KPIs
 $cntEntra   = @($entraDevices).Count
 $cntHAADJ   = @($entraDevices | Where-Object { $_.trustType -eq "ServerAd" }).Count
@@ -276,11 +437,7 @@ $cntCAPol_En= @($conditionalPolicies | Where-Object { $_.state -eq "enabled" }).
 # ==============================
 # 6. SERIALIZACION JSON (SEGURA)
 # ==============================
-function NullSafe {
-    param($Value, $Default = "")
-    if ($null -eq $Value) { return $Default }
-    return [string]$Value
-}
+# (NullSafe ya definida al inicio del script)
 
 function ConvertTo-SafeJson {
     param($Data)
@@ -298,8 +455,9 @@ function ConvertTo-SafeJson {
             manufacturer      = NullSafe $item.manufacturer
             model             = NullSafe $item.model
             serialNumber      = NullSafe $item.serialNumber
-            enrolledDateTime  = NullSafe $item.enrolledDateTime
-            managementAgent   = NullSafe $item.managementAgent
+            enrolledDateTime       = NullSafe $item.enrolledDateTime
+            managementAgent        = NullSafe $item.managementAgent
+            managedDeviceOwnerType = NullSafe $item.managedDeviceOwnerType
         }
     }
     return (ConvertTo-Json -InputObject @($arr) -Depth 3 -Compress)
@@ -313,13 +471,17 @@ function ConvertTo-SafeJsonEntra {
         $compliant = if ($null -ne $item.isCompliant) { [bool]$item.isCompliant } else { $false }
         $managed   = if ($null -ne $item.isManaged)   { [bool]$item.isManaged   } else { $false }
         $arr += [PSCustomObject]@{
-            displayName     = NullSafe $item.displayName
-            operatingSystem = NullSafe $item.operatingSystem
-            osVersion       = NullSafe $item.operatingSystemVersion
-            trustType       = NullSafe $item.trustType
-            isCompliant     = $compliant
-            isManaged       = $managed
-            lastSignIn      = NullSafe $item.approximateLastSignInDateTime
+            displayName          = NullSafe $item.displayName
+            operatingSystem      = NullSafe $item.operatingSystem
+            osVersion            = NullSafe $item.operatingSystemVersion
+            trustType            = NullSafe $item.trustType
+            mdmAppId             = NullSafe $item.mdmAppId
+            managementType       = NullSafe $item.managementType
+            registrationDateTime = NullSafe $item.registrationDateTime
+            deviceId             = NullSafe $item.deviceId
+            isCompliant          = $compliant
+            isManaged            = $managed
+            lastSignIn           = NullSafe $item.approximateLastSignInDateTime
         }
     }
     return (ConvertTo-Json -InputObject @($arr) -Depth 3 -Compress)
@@ -364,6 +526,209 @@ $jsonEntra   = ConvertTo-SafeJsonEntra  -Data $entraDevices
 $jsonRisky   = ConvertTo-SafeJsonRisky  -Data $riskyUsers
 $jsonCA      = ConvertTo-SafeJsonCA     -Data $conditionalPolicies
 
+# Serializar compliance policies con settings y dispositivos
+$jsonCompliancePolicies = if ($compliancePolicyData.Count -eq 0) { "[]" } else {
+    $arr = @()
+    foreach ($pol in $compliancePolicyData) {
+        $settings = @()
+        foreach ($s in $pol.settingSummaries) {
+            $settings += [PSCustomObject]@{
+                settingName         = NullSafe $s.settingName
+                unknownDeviceCount  = if ($null -ne $s.unknownDeviceCount)     { [int]$s.unknownDeviceCount }     else { 0 }
+                notApplicableCount  = if ($null -ne $s.notApplicableDeviceCount){ [int]$s.notApplicableDeviceCount } else { 0 }
+                compliantCount      = if ($null -ne $s.compliantDeviceCount)    { [int]$s.compliantDeviceCount }    else { 0 }
+                remediatedCount     = if ($null -ne $s.remediatedDeviceCount)   { [int]$s.remediatedDeviceCount }   else { 0 }
+                nonCompliantCount   = if ($null -ne $s.nonCompliantDeviceCount) { [int]$s.nonCompliantDeviceCount } else { 0 }
+                errorCount          = if ($null -ne $s.errorDeviceCount)        { [int]$s.errorDeviceCount }        else { 0 }
+                conflictCount       = if ($null -ne $s.conflictDeviceCount)     { [int]$s.conflictDeviceCount }     else { 0 }
+            }
+        }
+        $devs = @()
+        foreach ($d in $pol.nonCompliantDevices) {
+            $devs += [PSCustomObject]@{
+                deviceName   = NullSafe $d.deviceDisplayName
+                upn          = NullSafe $d.userPrincipalName
+                status       = NullSafe $d.status
+                lastReported = NullSafe $d.lastReportedDateTime
+            }
+        }
+        $arr += [PSCustomObject]@{
+            id                = $pol.id
+            displayName       = $pol.displayName
+            platform          = $pol.platform
+            lastModified      = $pol.lastModified
+            compliantCount    = $pol.compliantCount
+            nonCompliantCount = $pol.nonCompliantCount
+            errorCount        = $pol.errorCount
+            unknownCount      = $pol.unknownCount
+            gracePeriodCount  = $pol.gracePeriodCount
+            settings          = $settings
+            devices           = $devs
+        }
+    }
+    ConvertTo-Json -InputObject @($arr) -Depth 10 -Compress
+}
+
+# Diagnostico de cumplimiento en consola
+Write-Host ""
+Write-Host "  Diagnostico Cumplimiento:" -ForegroundColor Yellow
+foreach ($pol in $compliancePolicyData) {
+    Write-Host ("    [{0}] Conformes:{1}  NoConformes:{2}  Error:{3}  Dispositivos:{4}" -f `
+        $pol.displayName, $pol.compliantCount, $pol.nonCompliantCount, $pol.errorCount, $pol.nonCompliantDevices.Count) -ForegroundColor Gray
+}
+if ($compliancePolicyData.Count -eq 0) {
+    Write-Host "    Sin directivas de cumplimiento serializadas." -ForegroundColor DarkYellow
+}
+
+# IDs y nombres de dispositivos Intune para cruce con Entra (filtro huerfanos)
+$allIntune = [System.Collections.Generic.List[PSObject]]::new()
+foreach ($d in $winDevices)     { $allIntune.Add($d) }
+foreach ($d in $androidDevices) { $allIntune.Add($d) }
+foreach ($d in $iosDevices)     { $allIntune.Add($d) }
+foreach ($d in $macDevices)     { $allIntune.Add($d) }
+$intuneIdList = @($allIntune | Where-Object { $_.id } | ForEach-Object { '"' + $_.id.ToLower() + '"' }) -join ","
+$intuneNameList = @($allIntune | Where-Object { $_.deviceName } | ForEach-Object { '"' + $_.deviceName.ToLower() + '"' }) -join ","
+$jsonIntuneIds   = "[$intuneIdList]"
+$jsonIntuneNames = "[$intuneNameList]"
+
+# ==============================
+# 6b. OBTENER BUILDS WINDOWS ACTUALIZADOS DESDE MICROSOFT
+# ==============================
+Write-Host "  Obteniendo builds actuales de Windows desde Microsoft..." -ForegroundColor Yellow
+
+# Metadatos fijos por rama (prefijo, etiqueta, EoS, URL de referencia)
+$winBranchMeta = @(
+    @{ prefix='10.0.26200'; label='W11 26H1';         eol=$false; url='https://support.microsoft.com/topic/windows-11-version-26h1-update-history-253c73cd-cab1-4bfd-94dc-76c452273fc9' },
+    @{ prefix='10.0.26100'; label='W11 24H2/25H2';    eol=$false; url='https://support.microsoft.com/topic/windows-11-version-24h2-update-history-0929c747-1815-4543-8461-0160d16f15e5' },
+    @{ prefix='10.0.22631'; label='W11 23H2 (EoS)';   eol=$true;  url='https://support.microsoft.com/topic/windows-11-version-23h2-update-history-59875222-b990-4bd9-932f-91a5954de434' },
+    @{ prefix='10.0.22621'; label='W11 22H2 (EoS)';   eol=$true;  url='https://support.microsoft.com/topic/windows-11-version-22h2-update-history-ec4229c3-9184-4bd8-b4d1-97f83765a053' },
+    @{ prefix='10.0.19045'; label='W10 22H2 (EoS)';   eol=$true;  url='https://support.microsoft.com/topic/windows-10-update-history-8127c2c6-6edf-4fdf-8b9f-0f7be1ef3562' },
+    @{ prefix='10.0.19044'; label='W10 21H2 (EoS)';   eol=$true;  url='https://support.microsoft.com/topic/windows-10-update-history-8127c2c6-6edf-4fdf-8b9f-0f7be1ef3562' }
+)
+
+# Fallback hardcodeado por si falla la conexion
+$winFallback = @{
+    '10.0.26200' = '10.0.26200.8246'
+    '10.0.26100' = '10.0.26100.8246'
+    '10.0.22631' = '10.0.22631.5189'
+    '10.0.22621' = '10.0.22621.5189'
+    '10.0.19045' = '10.0.19045.6456'
+    '10.0.19044' = '10.0.19044.6456'
+}
+
+# Extrae la build mas alta que coincida con el prefijo dado de un bloque de texto HTML/JSON
+function Select-HighestBuild {
+    param([string]$Text, [string]$Prefix)
+    $buildNum = $Prefix.Split('.')[2]
+    # Parsear filas <tr>...</tr> buscando actualizaciones "B" mensuales
+    $trMatches = [regex]::Matches($Text, "<tr>.*?</tr>", [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    $versiones = @()
+    foreach ($m in $trMatches) {
+        $fila = $m.Value
+        if ($fila -match "$buildNum\.(\d{4,5})" -and $fila -match "\d{4}-\d{2} B") {
+            $build = [regex]::Match($fila, "$buildNum\.\d{4,5}").Value
+            $versiones += $build
+        }
+    }
+    if ($versiones.Count -gt 0) {
+        return ($versiones | Sort-Object { [int]($_.Split('.')[1]) } -Descending | Select-Object -First 1)
+    }
+    # Fallback: regex general sin filtro de "B"
+    $pattern = "10\.0\.$([regex]::Escape($buildNum))\.(\d{4,5})"
+    $hits = [regex]::Matches($Text, $pattern)
+    if ($hits.Count -eq 0) { return $null }
+    return ($hits | ForEach-Object { $_.Value } | Sort-Object { [int]($_.Split('.')[3]) } -Descending | Select-Object -First 1)
+}
+
+function Get-LatestWindowsBuild {
+    param([string]$Prefix)
+
+    $buildNum = $Prefix.Split('.')[2]
+    $w11Builds = @('26200','26100','22631','22621','22000')
+
+    # --- Fuente 1: Paginas oficiales Microsoft Release Health ---
+    # W11: https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information
+    # W10: https://learn.microsoft.com/en-us/windows/release-health/release-information
+    try {
+        $releaseUrl = if ($buildNum -in $w11Builds) {
+            'https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information'
+        } else {
+            'https://learn.microsoft.com/en-us/windows/release-health/release-information'
+        }
+        $archivoHTML = "$env:TEMP\release_info_$($Prefix.Replace('.','_')).html"
+        Invoke-WebRequest -Uri $releaseUrl -OutFile $archivoHTML -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+        $contenido = Get-Content -Path $archivoHTML -Raw -ErrorAction Stop
+        if ($contenido -and $contenido.Length -gt 0) {
+            $found = Select-HighestBuild -Text $contenido -Prefix $Prefix
+            if ($found) { return $found }
+        }
+    } catch {}
+
+    # --- Fuente 2: JSON oficial de Microsoft Release Info (blob Azure) ---
+    try {
+        $uri  = 'https://winreleaseinfoprod.blob.core.windows.net/winreleaseinfo/en-US.json'
+        $data = Invoke-RestMethod -Uri $uri -TimeoutSec 20 -ErrorAction Stop
+        $candidates = @()
+        foreach ($product in $data.products) {
+            foreach ($release in $product.releases) {
+                $bn = [string]($release.buildNumber)
+                if ($bn -match "^10\.0\.$([regex]::Escape($buildNum))\.\d+$") {
+                    $candidates += [int]($bn.Split('.')[3])
+                }
+            }
+        }
+        if ($candidates.Count -gt 0) {
+            $rev = ($candidates | Sort-Object -Descending | Select-Object -First 1)
+            return "10.0.$buildNum.$rev"
+        }
+    } catch {}
+
+    # --- Fuente 3: Windows Update Catalog ---
+    try {
+        $searchUri = "https://www.catalog.update.microsoft.com/Search.aspx?q=$buildNum+cumulative"
+        $resp      = Invoke-WebRequest -Uri $searchUri -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+        $found     = Select-HighestBuild -Text $resp.Content -Prefix $Prefix
+        if ($found) { return $found }
+    } catch {}
+
+    return $null
+}
+
+# Iterar cada rama
+$winBuildResults = @{}
+$winBuildSource  = @{}
+foreach ($branch in $winBranchMeta) {
+    $fetched = Get-LatestWindowsBuild -Prefix $branch.prefix
+    if ($fetched) {
+        $winBuildResults[$branch.prefix] = $fetched
+        $winBuildSource[$branch.prefix]  = 'live'
+        Write-Host "    $($branch.prefix) -> $fetched  [OK - en vivo]" -ForegroundColor Green
+    } else {
+        $winBuildResults[$branch.prefix] = $winFallback[$branch.prefix]
+        $winBuildSource[$branch.prefix]  = 'fallback'
+        Write-Host "    $($branch.prefix) -> $($winFallback[$branch.prefix])  [fallback]" -ForegroundColor DarkYellow
+    }
+}
+
+$allFallback = -not ($winBuildSource.Values -contains 'live')
+if ($allFallback) {
+    Write-Host "  [!] Todas las ramas usaron fallback. Verifica la conexion a internet." -ForegroundColor Yellow
+}
+
+# Construir bloque JS con origen de cada build
+$buildOrigin = if ($allFallback) { "FALLBACK (sin conexion) - $fechaReporte" } else { "Obtenidos automaticamente desde Microsoft - $fechaReporte" }
+$winLatestJs = "var WIN_LATEST = {`n"
+foreach ($branch in $winBranchMeta) {
+    $p      = $branch.prefix
+    $build  = $winBuildResults[$p]
+    $label  = $branch.label
+    $eolJs  = if ($branch.eol) { 'true' } else { 'false' }
+    $url    = $branch.url
+    $src    = $winBuildSource[$p]
+    $winLatestJs += "  '$p': { build: '$build', label: '$label', eol: $eolJs, url: '$url', source: '$src' },`n"
+}
+$winLatestJs += "};`n// $buildOrigin"
+
 # ==============================
 # 7. CALCULO DONUT (porcentajes -> dasharray con circunf. 289px)
 # ==============================
@@ -385,6 +750,13 @@ $dashWin     = Get-DashArray -Count $cntWin     -Total $cntTotal
 $dashAndroid = Get-DashArray -Count $cntAndroid -Total $cntTotal
 $dashiOS     = Get-DashArray -Count $cntiOS     -Total $cntTotal
 $dashMac     = Get-DashArray -Count $cntMac     -Total $cntTotal
+
+# Donut Tipo de Propiedad
+$dashCorporate    = Get-DashArray -Count $cntCorporate    -Total $cntTotal
+$dashPersonal     = Get-DashArray -Count $cntPersonal     -Total $cntTotal
+$dashOwnerUnknown = Get-DashArray -Count $cntOwnerUnknown -Total $cntTotal
+$rotPersonal      = [string]([math]::Round(($cntCorporate    / [math]::Max($cntTotal,1)) * 360) - 90)
+$rotOwnerUnknown  = [string]([math]::Round((($cntCorporate + $cntPersonal) / [math]::Max($cntTotal,1)) * 360) - 90)
 
 # Offset acumulado del donut
 $offsetWin     = 0
@@ -428,7 +800,7 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
 .header::after { content:''; position:absolute; bottom:0; left:0; right:0; height:1px;
   background: linear-gradient(90deg, transparent, var(--blue), var(--cyan), transparent); }
 .logo-area { display:flex; align-items:center; gap:12px; }
-.logo-icon { width:36px; height:36px; border-radius:8px; display:flex; align-items:center;
+.logo-icon { width:56px; height:56px; border-radius:10px; display:flex; align-items:center;
   justify-content:center; overflow:hidden; background:rgba(99,179,237,0.1); }
 .logo-icon img { max-width:100%; max-height:100%; object-fit:contain; }
 .logo-text { font-size:16px; font-weight:700; }
@@ -615,7 +987,7 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
 <nav class="tabs-bar">
   <div class="tab active" onclick="switchTab('intune', this)">Intune <span class="tab-badge">$cntTotal</span></div>
   <div class="tab" onclick="switchTab('entra', this)">Entra ID <span class="tab-badge">$cntEntraNum</span></div>
-  <div class="tab" onclick="switchTab('actividad', this)">Acceso Cond. <span class="tab-badge">$cntCAPolNum</span></div>
+  <div class="tab" onclick="switchTab('cumplimiento', this)">Cumplimiento <span class="tab-badge" id="tabBadgeCumpl">-</span></div>
   <div class="tab" onclick="switchTab('reporte', this)">Reporte Ejecutivo</div>
 </nav>
 
@@ -672,12 +1044,40 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
           <span class="badge badge-compliant">$compMac% OK</span>
         </div>
       </div>
+      <div class="kpi-card" style="--card-accent:#fc8181; --icon-bg:rgba(252,129,129,0.12); grid-column: span 2;" onclick="showDuplicatesPanel()">
+        <div class="kpi-header">
+          <div class="kpi-platform">Dispositivos Duplicados (por N&#xBA; de Serie)</div>
+          <div class="kpi-icon">&#x26A0;&#xFE0F;</div>
+        </div>
+        <div style="display:flex; align-items:baseline; gap:16px;">
+          <div class="kpi-count" id="dupCount">-</div>
+          <div class="kpi-pct" id="dupSubtitle">Calculando...</div>
+        </div>
+        <div class="kpi-footer">
+          <span class="kpi-label">Haz clic para ver detalle</span>
+          <span class="badge badge-error" id="dupBadge">-</span>
+        </div>
+      </div>
+      <div class="kpi-card" style="--card-accent:#fc8181; --icon-bg:rgba(252,129,129,0.12); grid-column: span 2;" onclick="showIntuneStalePanel()">
+        <div class="kpi-header">
+          <div class="kpi-platform">Dispositivos Obsoletos Intune (sin sincronizacion &gt; 3 meses)</div>
+          <div class="kpi-icon">&#x1F4C5;</div>
+        </div>
+        <div style="display:flex; align-items:baseline; gap:16px;">
+          <div class="kpi-count" id="intuneStaleCount">-</div>
+          <div class="kpi-pct" id="intuneStaleSubtitle">Calculando...</div>
+        </div>
+        <div class="kpi-footer">
+          <span class="kpi-label">Haz clic para ver detalle</span>
+          <span class="badge badge-error" id="intuneStaleBadge">-</span>
+        </div>
+      </div>
     </div>
 
     <div class="two-col">
       <div class="panel">
         <div class="panel-header">
-          <span class="panel-title">Distribucion por Plataforma</span>
+          <span class="panel-title">Tipo de Propiedad</span>
           <span class="panel-tag">$cntTotal dispositivos</span>
         </div>
         <div class="panel-body">
@@ -685,32 +1085,26 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
             <svg width="130" height="130" viewBox="0 0 130 130" style="flex-shrink:0">
               <circle cx="65" cy="65" r="46" fill="none" stroke="#1a2235" stroke-width="22"/>
               <circle cx="65" cy="65" r="46" fill="none" stroke="#63b3ed" stroke-width="22"
-                stroke-dasharray="$dashWin" transform="rotate(-90 65 65)"/>
-              <circle cx="65" cy="65" r="46" fill="none" stroke="#68d391" stroke-width="22"
-                stroke-dasharray="$dashAndroid" transform="rotate($rotAndroid 65 65)"/>
-              <circle cx="65" cy="65" r="46" fill="none" stroke="#a78bfa" stroke-width="22"
-                stroke-dasharray="$dashiOS" transform="rotate($rotiOS 65 65)"/>
+                stroke-dasharray="$dashCorporate" transform="rotate(-90 65 65)"/>
               <circle cx="65" cy="65" r="46" fill="none" stroke="#f6ad55" stroke-width="22"
-                stroke-dasharray="$dashMac" transform="rotate($rotMac 65 65)"/>
+                stroke-dasharray="$dashPersonal" transform="rotate($rotPersonal 65 65)"/>
+              <circle cx="65" cy="65" r="46" fill="none" stroke="#64748b" stroke-width="22"
+                stroke-dasharray="$dashOwnerUnknown" transform="rotate($rotOwnerUnknown 65 65)"/>
               <text x="65" y="60" text-anchor="middle" fill="#e2e8f0" font-size="20" font-weight="700" font-family="Syne,sans-serif">$cntTotal</text>
               <text x="65" y="76" text-anchor="middle" fill="#64748b" font-size="9" font-family="IBM Plex Mono,monospace">TOTAL</text>
             </svg>
             <div class="donut-legend">
-              <div class="legend-row">
-                <div class="legend-left"><span class="legend-dot" style="background:#63b3ed"></span>Windows</div>
-                <div><span class="legend-count">$cntWin</span><span class="legend-pct">$pctWin%</span></div>
+              <div class="legend-row" style="cursor:pointer;" onclick="showOwnerPanel('company')" onmouseover="this.style.background='rgba(99,179,237,0.04)'" onmouseout="this.style.background=''">
+                <div class="legend-left"><span class="legend-dot" style="background:#63b3ed"></span>Corporativo</div>
+                <div><span class="legend-count">$cntCorporate</span><span class="legend-pct">$pctCorporate%</span></div>
               </div>
-              <div class="legend-row">
-                <div class="legend-left"><span class="legend-dot" style="background:#68d391"></span>Android</div>
-                <div><span class="legend-count">$cntAndroid</span><span class="legend-pct">$pctAndroid%</span></div>
+              <div class="legend-row" style="cursor:pointer;" onclick="showOwnerPanel('personal')" onmouseover="this.style.background='rgba(246,173,85,0.04)'" onmouseout="this.style.background=''">
+                <div class="legend-left"><span class="legend-dot" style="background:#f6ad55"></span>Personal</div>
+                <div><span class="legend-count">$cntPersonal</span><span class="legend-pct">$pctPersonal%</span></div>
               </div>
-              <div class="legend-row">
-                <div class="legend-left"><span class="legend-dot" style="background:#a78bfa"></span>iOS / iPadOS</div>
-                <div><span class="legend-count">$cntiOS</span><span class="legend-pct">$pctiOS%</span></div>
-              </div>
-              <div class="legend-row">
-                <div class="legend-left"><span class="legend-dot" style="background:#f6ad55"></span>macOS</div>
-                <div><span class="legend-count">$cntMac</span><span class="legend-pct">$pctMac%</span></div>
+              <div class="legend-row" style="cursor:pointer;" onclick="showOwnerPanel('unknown')" onmouseover="this.style.background='rgba(100,116,139,0.04)'" onmouseout="this.style.background=''">
+                <div class="legend-left"><span class="legend-dot" style="background:#64748b"></span>Desconocido</div>
+                <div><span class="legend-count">$cntOwnerUnknown</span><span class="legend-pct">$pctOwnerUnknown%</span></div>
               </div>
             </div>
           </div>
@@ -762,7 +1156,10 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
       <div class="obs-card">
         <div class="obs-card-header">
           <span style="font-size:12px; font-weight:600;">Estado de Actualizacion</span>
-          <span class="panel-tag" id="obsTag">-</span>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="panel-tag" id="obsTag">-</span>
+            <span class="panel-tag" id="obsBuildsTag" style="border-color:rgba(79,209,197,0.3); color:var(--cyan); background:rgba(79,209,197,0.06);" title="Builds obtenidos automaticamente desde Microsoft Release Health al generar este informe">&#x1F5D8; Builds auto</span>
+          </div>
         </div>
         <div class="obs-summary">
           <div class="obs-half">
@@ -796,7 +1193,7 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
       <div class="obs-card">
         <div class="obs-card-header">
           <span style="font-size:12px; font-weight:600;">Tipo de Gestion</span>
-          <span class="panel-tag">MDM &middot; MDE &middot; SCCM</span>
+          <span class="panel-tag">Defender &middot; Intune &middot; Android Ent.</span>
         </div>
         <div style="padding:14px 18px; display:flex; flex-direction:column; gap:10px;" id="obsByMgmt"></div>
       </div>
@@ -861,6 +1258,103 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
         </div>
       </div>
     </div>
+
+    <!-- PANEL TIPO DE PROPIEDAD -->
+    <div class="panel" id="ownerPanel" style="display:none; margin-top:24px;">
+      <div class="panel-header">
+        <span class="panel-title" id="ownerPanelTitle">Dispositivos</span>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <span class="panel-tag" id="ownerPanelCount">-</span>
+          <button class="close-btn" onclick="document.getElementById('ownerPanel').style.display='none'">Cerrar X</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="search-wrap">
+          <span class="search-icon">&#x1F50D;</span>
+          <input class="search-input" id="searchOwner" placeholder="Buscar por nombre, usuario, OS..." oninput="filterOwnerDevices()">
+        </div>
+        <table class="device-table">
+          <thead>
+            <tr>
+              <th>Dispositivo</th>
+              <th>Usuario</th>
+              <th>OS</th>
+              <th>Version</th>
+              <th>Cumplimiento</th>
+              <th>Fabricante / Modelo</th>
+              <th>Ultima Sync</th>
+            </tr>
+          </thead>
+          <tbody id="ownerTableBody"></tbody>
+        </table>
+        <div style="display:flex; justify-content:center; align-items:center; gap:15px; margin-top:15px; padding-top:15px; border-top:1px solid var(--border);">
+          <button class="export-btn" id="ownerPrevPage" onclick="changeOwnerPage(-1)" style="padding:5px 12px;">&laquo; Anterior</button>
+          <span id="ownerPageIndicator" style="font-family:var(--mono); font-size:12px; color:var(--muted);">Pagina 1 de 1</span>
+          <button class="export-btn" id="ownerNextPage" onclick="changeOwnerPage(1)" style="padding:5px 12px;">Siguiente &raquo;</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- PANEL DISPOSITIVOS DUPLICADOS -->
+    <div class="panel" id="duplicatesPanel" style="display:none; margin-bottom:24px;">
+      <div class="panel-header">
+        <span class="panel-title">Dispositivos Duplicados por N&#xBA; de Serie</span>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <span class="panel-tag" id="dupPanelCount">-</span>
+          <button class="close-btn" onclick="document.getElementById('duplicatesPanel').style.display='none'">Cerrar X</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="search-wrap">
+          <span class="search-icon">&#x1F50D;</span>
+          <input class="search-input" id="searchDup" placeholder="Buscar por nombre, numero de serie, propietario..." oninput="filterDuplicates()">
+        </div>
+        <table class="device-table" id="dupTable">
+          <thead>
+            <tr>
+              <th style="width:28px"></th>
+              <th>N&#xBA; de Serie</th>
+              <th>Duplicados</th>
+              <th>Propietarios</th>
+            </tr>
+          </thead>
+          <tbody id="dupTableBody"></tbody>
+        </table>
+        <div style="display:flex; justify-content:center; align-items:center; gap:15px; margin-top:15px; padding-top:15px; border-top:1px solid var(--border);">
+          <button class="export-btn" id="dupPrevPage" onclick="changeDupPage(-1)" style="padding:5px 12px;">&laquo; Anterior</button>
+          <span id="dupPageIndicator" style="font-family:var(--mono); font-size:12px; color:var(--muted);">Pagina 1 de 1</span>
+          <button class="export-btn" id="dupNextPage" onclick="changeDupPage(1)" style="padding:5px 12px;">Siguiente &raquo;</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- PANEL OBSOLETOS INTUNE (sync > 3 meses) -->
+    <div class="panel" id="intuneStalePanel" style="display:none; margin-bottom:24px;">
+      <div class="panel-header">
+        <span class="panel-title">Dispositivos sin sincronizacion &gt; 3 meses</span>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <span class="panel-tag" id="intuneStalePanelCount">-</span>
+          <button class="close-btn" onclick="document.getElementById('intuneStalePanel').style.display='none'">Cerrar X</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="search-wrap">
+          <span class="search-icon">&#x1F50D;</span>
+          <input class="search-input" id="searchIntuneStale" placeholder="Buscar por nombre, usuario, OS..." oninput="filterIntuneStale()">
+        </div>
+        <table class="device-table">
+          <thead><tr>
+            <th>Dispositivo</th><th>Usuario</th><th>OS</th><th>Version</th><th>Cumplimiento</th><th>Ultima Sync</th><th>Dias sin Sync</th>
+          </tr></thead>
+          <tbody id="intuneStaleBody"></tbody>
+        </table>
+        <div style="display:flex; justify-content:center; align-items:center; gap:15px; margin-top:15px; padding-top:15px; border-top:1px solid var(--border);">
+          <button class="export-btn" id="intuneStalePrev" onclick="changeIntuneStale(-1)" style="padding:5px 12px;">&laquo; Anterior</button>
+          <span id="intuneStaleIndicator" style="font-family:var(--mono); font-size:12px; color:var(--muted);">Pagina 1 de 1</span>
+          <button class="export-btn" id="intuneStaleNext" onclick="changeIntuneStale(1)" style="padding:5px 12px;">Siguiente &raquo;</button>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -869,31 +1363,64 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
   <div class="main">
     <div class="section-label">Resumen Entra ID</div>
 
-    <!-- GRID 3x2 con onclick en cada recuadro -->
-    <div class="entra-grid" style="display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-bottom:24px;">
+    <!-- GRID 4x2 -->
+    <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:24px;" id="entraStatGrid">
+      <!-- FILA 1: tipos de union -->
       <div class="entra-stat" onclick="showEntraPanel('all')">
-        <div class="entra-stat-label">Total Dispositivos Registrados</div>
+        <div class="entra-stat-label">Total Registrados</div>
         <div class="entra-stat-value" style="color:var(--blue)">$cntEntraNum</div>
+        <div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:6px;">Haz clic para ver todos</div>
       </div>
       <div class="entra-stat" onclick="showEntraPanel('haadj')">
         <div class="entra-stat-label">Union Hibrida (HAADJ)</div>
         <div class="entra-stat-value" style="color:var(--cyan)">$cntHAADJ</div>
+        <div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:6px;">trustType: ServerAd</div>
       </div>
       <div class="entra-stat" onclick="showEntraPanel('aadj')">
         <div class="entra-stat-label">Union Pura Entra (AADJ)</div>
         <div class="entra-stat-value" style="color:var(--purple)">$cntEntraAD</div>
+        <div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:6px;">trustType: AzureAd</div>
       </div>
-      <div class="entra-stat" onclick="showEntraPanel('risky')">
-        <div class="entra-stat-label">Usuarios con MFA Activo</div>
-        <div class="entra-stat-value" style="color:var(--green)">$pctMFAVal%</div>
+      <div class="entra-stat" onclick="showEntraPanel('registered')">
+        <div class="entra-stat-label">Registered con MDM</div>
+        <div class="entra-stat-value" style="color:var(--green)" id="cntRegisteredMdm">-</div>
+        <div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:6px;">trustType: Workplace + MDM</div>
       </div>
-      <div class="entra-stat" onclick="showEntraPanel('ca')">
-        <div class="entra-stat-label">Politicas Acc. Condicional</div>
-        <div class="entra-stat-value" style="color:var(--orange)">$cntCAPolNum</div>
+      <!-- FILA 2: anomalias -->
+      <div class="entra-stat" onclick="showEntraPanel('huerfanos')" style="border-color:rgba(252,129,129,0.25);">
+        <div class="entra-stat-label" style="color:var(--red)">&#x26A0; Huerfanos</div>
+        <div class="entra-stat-value" style="color:var(--red)" id="cntHuerfanos">-</div>
+        <div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:6px;">Sin MDM, sin propietario, reg. pendiente</div>
       </div>
-      <div class="entra-stat" onclick="showEntraPanel('ca-enabled')">
-        <div class="entra-stat-label">Pol. Acc. Condicional (Activas)</div>
-        <div class="entra-stat-value" style="color:var(--green)">$cntCAPol_En</div>
+      <div class="entra-stat" onclick="showEntraPanel('o365mobile')" style="border-color:rgba(246,173,85,0.25);">
+        <div class="entra-stat-label" style="color:var(--orange)">Office 365 Mobile</div>
+        <div class="entra-stat-value" style="color:var(--orange)" id="cntO365Mobile">-</div>
+        <div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:6px;">MDM: Office365 (no gestionado)</div>
+      </div>
+      <div class="entra-stat" onclick="showEntraPanel('reg-sin-mdm')" style="border-color:rgba(167,139,250,0.25);">
+        <div class="entra-stat-label" style="color:var(--purple)">Registered sin MDM</div>
+        <div class="entra-stat-value" style="color:var(--purple)" id="cntRegSinMdm">-</div>
+        <div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:6px;">Workplace + actividad reciente</div>
+      </div>
+      <div class="entra-stat" onclick="showEntraPanel('obsoletos-entra')" style="border-color:rgba(252,129,129,0.25);">
+        <div class="entra-stat-label" style="color:var(--red)">Obsoletos Entra</div>
+        <div class="entra-stat-value" style="color:var(--red)" id="cntObsoletosEntra">-</div>
+        <div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:6px;">Sin actividad &gt; 6 meses</div>
+      </div>
+      <div class="entra-stat" onclick="showEntraPanel('correccion-identidad')" style="border-color:rgba(79,209,197,0.25);">
+        <div class="entra-stat-label" style="color:var(--cyan)">&#x1F527; Correccion Identidad</div>
+        <div class="entra-stat-value" style="color:var(--cyan)" id="cntCorreccionIdentidad">-</div>
+        <div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:6px;">MDM registrado, sin fecha de registro</div>
+      </div>
+      <div class="entra-stat" onclick="showEntraPanel('solo-mde')" style="border-color:rgba(167,139,250,0.25);">
+        <div class="entra-stat-label" style="color:var(--purple)">&#x1F6E1; Solo MDE / Defender</div>
+        <div class="entra-stat-value" style="color:var(--purple)" id="cntSoloMde">-</div>
+        <div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:6px;">managementType: MicrosoftSense</div>
+      </div>
+      <div class="entra-stat" onclick="showEntraPanel('dup-entra')" style="border-color:rgba(252,129,129,0.25);">
+        <div class="entra-stat-label" style="color:var(--red)">&#x26A0; Duplicados Entra ID</div>
+        <div class="entra-stat-value" style="color:var(--red)" id="cntDupEntra">-</div>
+        <div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:6px;">Mismo nombre de dispositivo en Entra</div>
       </div>
     </div>
 
@@ -950,6 +1477,13 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
           <span class="search-icon">&#x1F50D;</span>
           <input class="search-input" id="searchEntra" placeholder="Buscar dispositivo Entra ID..." oninput="filterEntra()">
         </div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:14px;" id="entraFilterPlatBtns">
+          <button class="ver-plat-btn active" data-plat="all"     onclick="selectEntraPlat(this,'all')">Todos</button>
+          <button class="ver-plat-btn"        data-plat="windows" onclick="selectEntraPlat(this,'windows')">Windows</button>
+          <button class="ver-plat-btn"        data-plat="android" onclick="selectEntraPlat(this,'android')">Android</button>
+          <button class="ver-plat-btn"        data-plat="ios"     onclick="selectEntraPlat(this,'ios')">iOS</button>
+          <button class="ver-plat-btn"        data-plat="macos"   onclick="selectEntraPlat(this,'macos')">macOS</button>
+        </div>
         <table class="device-table">
           <thead>
             <tr>
@@ -957,9 +1491,11 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
               <th>OS</th>
               <th>Version</th>
               <th>Tipo de Union</th>
+              <th>MDM</th>
               <th>Gestionado</th>
               <th>Conforme</th>
               <th>Ultimo Inicio de Sesion</th>
+              <th id="thDiasSinActividad" style="display:none">Dias sin Actividad</th>
             </tr>
           </thead>
           <tbody id="entraTableBody"></tbody>
@@ -972,54 +1508,91 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
       </div>
     </div>
 
-    <!-- PANEL RISKY USERS (siempre visible en Entra) -->
-    <div class="panel" id="riskyPanel">
+    <!-- PANEL DUPLICADOS ENTRA ID (agrupado por nombre) -->
+    <div class="panel" id="entraDupPanel" style="display:none; margin-bottom:24px;">
       <div class="panel-header">
-        <span class="panel-title">Identidades en Riesgo</span>
-        <span class="panel-tag">Entra ID Protection - $cntRiskyU detectadas</span>
+        <span class="panel-title">Dispositivos Duplicados en Entra ID (por nombre)</span>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <span class="panel-tag" id="entraDupPanelCount">-</span>
+          <button class="close-btn" onclick="document.getElementById('entraDupPanel').style.display='none'">Cerrar X</button>
+        </div>
       </div>
-      <div class="panel-body" style="padding:0 20px 20px;">
-        <table class="risk-table" id="riskyTable">
+      <div class="panel-body">
+        <div class="search-wrap">
+          <span class="search-icon">&#x1F50D;</span>
+          <input class="search-input" id="searchEntraDup" placeholder="Buscar por nombre, tipo de union, propietario..." oninput="filterEntraDuplicates()">
+        </div>
+        <table class="device-table" id="entraDupTable">
           <thead>
             <tr>
-              <th>Usuario</th>
-              <th>UPN</th>
-              <th>Nivel Riesgo</th>
-              <th>Detalle</th>
-              <th>Ultima Actualizacion</th>
+              <th style="width:28px"></th>
+              <th>Nombre</th>
+              <th>Duplicados</th>
+              <th>Tipos de Union</th>
             </tr>
           </thead>
-          <tbody id="riskyTableBody"></tbody>
+          <tbody id="entraDupTableBody"></tbody>
         </table>
+        <div style="display:flex; justify-content:center; align-items:center; gap:15px; margin-top:15px; padding-top:15px; border-top:1px solid var(--border);">
+          <button class="export-btn" id="entraDupPrevPage" onclick="changeEntraDupPage(-1)" style="padding:5px 12px;">&laquo; Anterior</button>
+          <span id="entraDupPageIndicator" style="font-family:var(--mono); font-size:12px; color:var(--muted);">Pagina 1 de 1</span>
+          <button class="export-btn" id="entraDupNextPage" onclick="changeEntraDupPage(1)" style="padding:5px 12px;">Siguiente &raquo;</button>
+        </div>
       </div>
     </div>
 
   </div>
 </div>
 
-<!-- TAB ACCESO CONDICIONAL -->
-<div class="tab-content" id="tab-actividad">
+<!-- TAB CUMPLIMIENTO -->
+<div class="tab-content" id="tab-cumplimiento">
   <div class="main">
-    <div class="section-label">Politicas de Acceso Condicional</div>
-    <div class="panel">
+
+    <!-- KPIs globales -->
+    <div class="section-label">Resumen de Cumplimiento por Plataforma</div>
+    <div id="cumplKpiGrid" style="display:grid; grid-template-columns:repeat(5,1fr); gap:14px; margin-bottom:28px;"></div>
+
+    <!-- Filtros de plataforma -->
+    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:20px; align-items:center;">
+      <span style="font-family:var(--mono); font-size:10px; color:var(--muted); letter-spacing:1px; text-transform:uppercase;">Plataforma:</span>
+      <button class="ver-plat-btn active" id="cumplBtnAll"     onclick="setCumplFilter('all',this)">Todas</button>
+      <button class="ver-plat-btn"        id="cumplBtnWin"     onclick="setCumplFilter('Windows',this)">Windows</button>
+      <button class="ver-plat-btn"        id="cumplBtnAndroid" onclick="setCumplFilter('Android',this)">Android</button>
+      <button class="ver-plat-btn"        id="cumplBtnIos"     onclick="setCumplFilter('iOS',this)">iOS</button>
+      <button class="ver-plat-btn"        id="cumplBtnMac"     onclick="setCumplFilter('macOS',this)">macOS</button>
+    </div>
+
+    <!-- Lista de directivas -->
+    <div id="cumplPoliciesList"></div>
+
+    <!-- Panel detalle: dispositivos no conformes de una directiva -->
+    <div class="panel" id="cumplDevPanel" style="display:none; margin-top:20px;">
       <div class="panel-header">
-        <span class="panel-title" id="caTitle">Politicas de Acceso Condicional</span>
-        <span class="panel-tag" id="caCount">$cntCAPolNum total - $cntCAPol_En habilitadas</span>
+        <span class="panel-title" id="cumplDevTitle">Dispositivos no conformes</span>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <span class="panel-tag" id="cumplDevCount">-</span>
+          <button class="close-btn" onclick="document.getElementById('cumplDevPanel').style.display='none'">Cerrar X</button>
+        </div>
       </div>
-      <div class="panel-body" style="padding:0 20px 20px;">
-        <table class="ca-table">
-          <thead>
-            <tr>
-              <th>Nombre de Politica</th>
-              <th>Estado</th>
-              <th>Creada</th>
-              <th>Modificada</th>
-            </tr>
-          </thead>
-          <tbody id="caTableBody"></tbody>
+      <div class="panel-body">
+        <div class="search-wrap">
+          <span class="search-icon">&#x1F50D;</span>
+          <input class="search-input" id="searchCumplDev" placeholder="Buscar por nombre o usuario..." oninput="filterCumplDevices()">
+        </div>
+        <table class="device-table">
+          <thead><tr>
+            <th>Dispositivo</th><th>Usuario</th><th>Estado</th><th>Ultimo Reporte</th>
+          </tr></thead>
+          <tbody id="cumplDevBody"></tbody>
         </table>
+        <div style="display:flex; justify-content:center; align-items:center; gap:15px; margin-top:15px; padding-top:15px; border-top:1px solid var(--border);">
+          <button class="export-btn" id="cumplDevPrev" onclick="changeCumplDevPage(-1)" style="padding:5px 12px;">&laquo; Anterior</button>
+          <span id="cumplDevPageInd" style="font-family:var(--mono); font-size:12px; color:var(--muted);">Pagina 1 de 1</span>
+          <button class="export-btn" id="cumplDevNext" onclick="changeCumplDevPage(1)" style="padding:5px 12px;">Siguiente &raquo;</button>
+        </div>
       </div>
     </div>
+
   </div>
 </div>
 
@@ -1027,7 +1600,7 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
 <div class="tab-content" id="tab-reporte">
   <div class="main">
     <div class="section-label">Resumen Ejecutivo</div>
-    <div class="report-kpi-row">
+    <div class="report-kpi-row" style="grid-template-columns:repeat(3,1fr);">
       <div class="report-kpi">
         <div class="report-kpi-val" style="color:var(--green)">$compGlobal%</div>
         <div class="report-kpi-lbl">Cumplimiento Global Intune</div>
@@ -1037,20 +1610,77 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
         <div class="report-kpi-lbl">Dispositivos Intune</div>
       </div>
       <div class="report-kpi">
-        <div class="report-kpi-val" style="color:var(--orange)">$cntRiskyU</div>
-        <div class="report-kpi-lbl">Identidades en Riesgo</div>
+        <div class="report-kpi-val" style="color:var(--red)">$cntNoCompliant</div>
+        <div class="report-kpi-lbl">Dispositivos No Conformes</div>
       </div>
       <div class="report-kpi">
         <div class="report-kpi-val" style="color:var(--cyan)">$cntEntraNum</div>
         <div class="report-kpi-lbl">Dispositivos Entra ID</div>
       </div>
-      <div class="report-kpi">
-        <div class="report-kpi-val" style="color:var(--purple)">$cntCAPolNum</div>
-        <div class="report-kpi-lbl">Politicas Acc. Condicional</div>
+      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('entra', document.querySelector('.tab:nth-child(2)')); setTimeout(function(){ showEntraPanel('registered'); }, 100);">
+        <div class="report-kpi-val" style="color:var(--green)" id="rptRegisteredMdm">-</div>
+        <div class="report-kpi-lbl">Registered con MDM</div>
       </div>
       <div class="report-kpi">
-        <div class="report-kpi-val" style="color:var(--red)">$cntNoCompliant</div>
-        <div class="report-kpi-lbl">Dispositivos No Conformes</div>
+        <div class="report-kpi-val" style="color:var(--purple)">$cntHAADJ</div>
+        <div class="report-kpi-lbl">Union Hibrida (HAADJ)</div>
+      </div>
+    </div>
+    <div class="section-label" style="margin-top:8px;">Anomalias Entra ID</div>
+    <div class="report-kpi-row" style="grid-template-columns:repeat(3,1fr);">
+      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('entra', document.querySelector('.tab:nth-child(2)')); setTimeout(function(){ showEntraPanel('huerfanos'); }, 100);">
+        <div class="report-kpi-val" style="color:var(--red)" id="rptHuerfanos">-</div>
+        <div class="report-kpi-lbl">&#x26A0; Huerfanos</div>
+      </div>
+      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('entra', document.querySelector('.tab:nth-child(2)')); setTimeout(function(){ showEntraPanel('o365mobile'); }, 100);">
+        <div class="report-kpi-val" style="color:var(--orange)" id="rptO365Mobile">-</div>
+        <div class="report-kpi-lbl">Office 365 Mobile</div>
+      </div>
+      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('entra', document.querySelector('.tab:nth-child(2)')); setTimeout(function(){ showEntraPanel('correccion-identidad'); }, 100);">
+        <div class="report-kpi-val" style="color:var(--cyan)" id="rptCorreccion">-</div>
+        <div class="report-kpi-lbl">&#x1F527; Correccion Identidad</div>
+      </div>
+    </div>
+    <div class="section-label" style="margin-top:8px;">Cumplimiento de Directivas</div>
+    <div class="report-kpi-row" style="grid-template-columns:repeat(4,1fr);" id="rptCumplRow">
+      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('cumplimiento', document.querySelector('.tab:nth-child(3)'));">
+        <div class="report-kpi-val" style="color:var(--blue)" id="rptCumplTotal">-</div>
+        <div class="report-kpi-lbl">Directivas Activas</div>
+      </div>
+      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('cumplimiento', document.querySelector('.tab:nth-child(3)'));">
+        <div class="report-kpi-val" style="color:var(--green)" id="rptCumplCompliant">-</div>
+        <div class="report-kpi-lbl">Dispositivos Conformes</div>
+      </div>
+      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('cumplimiento', document.querySelector('.tab:nth-child(3)'));">
+        <div class="report-kpi-val" style="color:var(--red)" id="rptCumplNonCompliant">-</div>
+        <div class="report-kpi-lbl">No Conformes</div>
+      </div>
+      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('cumplimiento', document.querySelector('.tab:nth-child(3)'));">
+        <div class="report-kpi-val" style="color:var(--orange)" id="rptCumplError">-</div>
+        <div class="report-kpi-lbl">Con Error / Desconocido</div>
+      </div>
+    </div>
+    <!-- Tabla resumen de directivas en el reporte -->
+    <div class="panel" style="margin-bottom:24px;">
+      <div class="panel-header">
+        <span class="panel-title">Resumen por Directiva</span>
+        <span class="panel-tag" id="rptCumplTag">-</span>
+      </div>
+      <div class="panel-body" style="padding:0;">
+        <table class="device-table" id="rptCumplTable">
+          <thead><tr>
+            <th>Directiva</th>
+            <th>Plataforma</th>
+            <th style="text-align:center">Conformes</th>
+            <th style="text-align:center">No Conformes</th>
+            <th style="text-align:center">Error</th>
+            <th style="text-align:center">Desconocido</th>
+            <th style="min-width:120px">Cumplimiento</th>
+          </tr></thead>
+          <tbody id="rptCumplBody">
+            <tr><td colspan="7" style="text-align:center; color:var(--muted); padding:20px; font-family:var(--mono); font-size:12px;">Cargando...</td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
     <div class="panel">
@@ -1067,13 +1697,27 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
   </div>
 </div>
 
-<footer class="footer">
-  <div class="footer-text">Microsoft Graph API v1.0 - $nombreCliente - Assessment: $fechaReporte</div>
-  <div>
+<footer class="footer" style="display:flex; align-items:center; justify-content:space-between;">
+  
+  <!-- IZQUIERDA -->
+  <div style="flex:1; display:flex; flex-direction:column; gap:2px;">
+    <div class="footer-text">Auditoria parque informatico v1.0 &#x2022; $nombreCliente &#x2022; Assessment actualizado: $fechaReporte</div>
+    <div class="footer-text" style="color:var(--blue);">Elaborado por: $autorInforme &#x2022; $anioCreacion</div>
+  </div>
+
+  <!-- CENTRO (LOGO OPCIONAL) -->
+  <div style="flex:1; display:flex; justify-content:center;">
+    <!-- img src="$logoUrl" alt="Logo" style="height:40px;" onerror="this.style.display='none'"-->
+    <img src="https://proimg.seidor.com/sites/default/files/styles/open_graph/public/2022-03/LOGO_COLOR_POSITIVE.png?itok=TSczsmGz" alt="Logo" style="height:40px;" onerror="this.style.display='none'">
+  </div>
+
+  <!-- DERECHA -->
+  <div style="flex:1; display:flex; justify-content:flex-end; gap:10px;">
     <a href="https://endpoint.microsoft.com" target="_blank" class="footer-link">Intune Portal</a>
     <a href="https://entra.microsoft.com" target="_blank" class="footer-link">Entra Portal</a>
     <a href="https://portal.azure.com" target="_blank" class="footer-link">Azure Portal</a>
   </div>
+
 </footer>
 
 <script>
@@ -1090,8 +1734,12 @@ const DATA = {
   macos:   ensureArray($jsonMac),
   entra:   ensureArray($jsonEntra),
   risky:   ensureArray($jsonRisky),
-  ca:      ensureArray($jsonCA)
+  ca:      ensureArray($jsonCA),
+  compliancePolicies: ensureArray($jsonCompliancePolicies)
 };
+// Sets de IDs y nombres Intune para cruce rapido O(1) en filtro huerfanos
+var INTUNE_IDS   = new Set(ensureArray($jsonIntuneIds).map(function(x){ return String(x).toLowerCase(); }));
+var INTUNE_NAMES = new Set(ensureArray($jsonIntuneNames).map(function(x){ return String(x).toLowerCase(); }));
 
 const platformNames = { windows:'Windows', android:'Android', ios:'iOS / iPadOS', macos:'macOS' };
 let currentPlatform = null;
@@ -1227,36 +1875,6 @@ function updateEntraView(data) {
   renderEntraPage();
 }
 
-function renderEntraPage() {
-  var tbody = document.getElementById('entraTableBody');
-  var totalPages = Math.ceil(filteredEntraData.length / PAGE_SIZE) || 1;
-  var start = (entraPage - 1) * PAGE_SIZE;
-  var pageData = filteredEntraData.slice(start, start + PAGE_SIZE);
-  var trustMap = { 'ServerAd':'Hibrida (HAADJ)', 'AzureAd':'Entra (AADJ)', 'Workplace':'Registrado' };
-
-  document.getElementById('pageIndicator').textContent = 'Pagina ' + entraPage + ' de ' + totalPages;
-  document.getElementById('prevPage').disabled = (entraPage === 1);
-  document.getElementById('nextPage').disabled = (entraPage === totalPages);
-  document.getElementById('prevPage').style.opacity = (entraPage === 1) ? '0.4' : '1';
-  document.getElementById('nextPage').style.opacity = (entraPage === totalPages) ? '0.4' : '1';
-
-  if (pageData.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:var(--muted); padding:24px; font-family:var(--mono)">Sin datos de Entra ID</td></tr>';
-    return;
-  }
-  tbody.innerHTML = pageData.map(function(d) {
-    return '<tr>' +
-      '<td style="font-weight:600">' + (d.displayName || '-') + '</td>' +
-      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + (d.operatingSystem || '-') + '</td>' +
-      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + (d.osVersion || '-') + '</td>' +
-      '<td style="font-size:11px; color:var(--muted)">' + (trustMap[d.trustType] || d.trustType || '-') + '</td>' +
-      '<td>' + (d.isManaged ? '<span class="badge badge-compliant">Si</span>' : '<span class="badge badge-muted">No</span>') + '</td>' +
-      '<td>' + (d.isCompliant ? '<span class="badge badge-compliant">Si</span>' : '<span class="badge badge-muted">No</span>') + '</td>' +
-      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + fmtDate(d.lastSignIn) + '</td>' +
-      '</tr>';
-  }).join('');
-}
-
 function changePage(step) {
   var totalPages = Math.ceil(filteredEntraData.length / PAGE_SIZE) || 1;
   var newPage = entraPage + step;
@@ -1267,11 +1885,24 @@ function changePage(step) {
   }
 }
 
+var entraActivePlatFilter = 'all';
+var entraShowDaysCol = false;
+
+function selectEntraPlat(btn, platKey) {
+  document.querySelectorAll('#entraFilterPlatBtns .ver-plat-btn').forEach(function(b) { b.classList.remove('active'); });
+  btn.classList.add('active');
+  entraActivePlatFilter = platKey;
+  filterEntra();
+}
+
 function filterEntra() {
   var q = document.getElementById('searchEntra').value.toLowerCase();
+  var platRe = VER_PLAT_MAP[entraActivePlatFilter] || null;
   var results = currentEntraData.filter(function(d) {
-    return (d.displayName||'').toLowerCase().indexOf(q) >= 0 ||
-           (d.operatingSystem||'').toLowerCase().indexOf(q) >= 0;
+    var matchText = (d.displayName||'').toLowerCase().indexOf(q) >= 0 ||
+                    (d.operatingSystem||'').toLowerCase().indexOf(q) >= 0;
+    var matchPlat = !platRe || platRe.test(d.operatingSystem || '');
+    return matchText && matchPlat;
   });
   updateEntraView(results);
 }
@@ -1280,52 +1911,303 @@ function closePanel() {
   document.getElementById('devicePanel').style.display = 'none';
 }
 
-// ---- ENTRA ----
+// ---- HELPERS ENTRA ----
+var SIX_MONTHS_MS  = 6  * 30 * 24 * 3600 * 1000;
+var THREE_MONTHS_MS = 3 * 30 * 24 * 3600 * 1000;
+
+function isO365Mobile(d) {
+  // MDM AppId de Office 365 Mobile: 7add3ecd-5b01-452e-b4bf-cdaf9df1d097
+  return (d.mdmAppId || '').toLowerCase().indexOf('7add3ecd') >= 0;
+}
+function isHuerfano(d) {
+  // Replica exacta del filtro PowerShell:
+  //   - Windows (no Server)
+  //   - registrationDateTime == null (sin fecha de registro)
+  //   - managementType != MicrosoftSense
+  //   - No existe en Intune por deviceId NI por displayName
+  var isWindows  = /windows/i.test(d.operatingSystem || '');
+  var isServer   = /server/i.test(d.operatingSystem || '');
+  var noRegDate  = !d.registrationDateTime || d.registrationDateTime === '';
+  var notSense   = (d.managementType || '').toLowerCase() !== 'microsoftsense';
+  var notInIntune = (
+    (!d.deviceId   || !INTUNE_IDS.has(String(d.deviceId).toLowerCase())) &&
+    (!d.displayName || !INTUNE_NAMES.has(String(d.displayName).toLowerCase()))
+  );
+  return isWindows && !isServer && noRegDate && notSense && notInIntune;
+}
+function isRegisteredSinMdm(d) {
+  var isWork   = d.trustType === 'Workplace';
+  var noMdm    = !d.mdmAppId || d.mdmAppId === '';
+  var notO365  = !isO365Mobile(d);
+  var recent   = d.lastSignIn && (Date.now() - new Date(d.lastSignIn).getTime()) < SIX_MONTHS_MS;
+  return isWork && noMdm && notO365 && recent;
+}
+function isSoloMde(d) {
+  // managementType === MicrosoftSense y tiene fecha de registro (no huerfano)
+  return (d.managementType || '').toLowerCase() === 'microsoftsense';
+}
+function isObsoletoEntra(d) {
+  // Los que no tienen lastSignIn se clasifican como huerfanos/MDE, no como obsoletos
+  if (!d.lastSignIn || d.lastSignIn === '') return false;
+  return (Date.now() - new Date(d.lastSignIn).getTime()) > SIX_MONTHS_MS;
+}
+function isRegisteredMdm(d) {
+  // Solo Windows, trustType Workplace, con MDM, excluye Office365Mobile
+  var isWindows = /windows/i.test(d.operatingSystem || '');
+  return isWindows && d.trustType === 'Workplace' && d.mdmAppId && d.mdmAppId !== '' && !isO365Mobile(d);
+}
+function isCorreccionIdentidad(d) {
+  // Dispositivos con propietario MDM registrado (isManaged=true) Y sin fecha de registro
+  // Excluye Office365Mobile y MicrosoftSense
+  var hasOwner  = d.isManaged === true;
+  var hasMdm    = d.mdmAppId && d.mdmAppId !== '';
+  var noReg     = !d.registrationDateTime || d.registrationDateTime === '';
+  var notSense  = (d.managementType || '').toLowerCase() !== 'microsoftsense';
+  var notO365   = !isO365Mobile(d);
+  return (hasOwner || hasMdm) && noReg && notSense && notO365;
+}
+
+// Precalculo de duplicados Entra por displayName
+var ENTRA_DUPES = {};
+(function() {
+  var nameMap = {};
+  (DATA.entra || []).forEach(function(d) {
+    var n = (d.displayName || '').trim().toLowerCase();
+    if (!n) return;
+    nameMap[n] = (nameMap[n] || []);
+    nameMap[n].push(d);
+  });
+  Object.keys(nameMap).forEach(function(k) {
+    if (nameMap[k].length > 1) ENTRA_DUPES[k] = nameMap[k];
+  });
+})();
+
+function isDuplicadoEntra(d) {
+  var n = (d.displayName || '').trim().toLowerCase();
+  return !!ENTRA_DUPES[n];
+}
+
+// Inicializar contadores de las tarjetas Entra anomalias
+function initEntraCards() {
+  var devs = DATA.entra || [];
+  var cntRM   = devs.filter(isRegisteredMdm).length;
+  var cntHu   = devs.filter(isHuerfano).length;
+  var cntO365 = devs.filter(isO365Mobile).length;
+  var cntRSM  = devs.filter(isRegisteredSinMdm).length;
+  var cntObs  = devs.filter(isObsoletoEntra).length;
+  var cntCorr = devs.filter(isCorreccionIdentidad).length;
+  var cntMde  = devs.filter(isSoloMde).length;
+  var cntDupE = Object.keys(ENTRA_DUPES).length;
+  document.getElementById('cntRegisteredMdm').textContent         = cntRM;
+  document.getElementById('cntHuerfanos').textContent             = cntHu;
+  document.getElementById('cntO365Mobile').textContent            = cntO365;
+  document.getElementById('cntRegSinMdm').textContent             = cntRSM;
+  document.getElementById('cntObsoletosEntra').textContent        = cntObs;
+  document.getElementById('cntCorreccionIdentidad').textContent   = cntCorr;
+  if (document.getElementById('cntSoloMde'))    document.getElementById('cntSoloMde').textContent    = cntMde;
+  if (document.getElementById('cntDupEntra'))   document.getElementById('cntDupEntra').textContent   = cntDupE;
+  // Reporte ejecutivo - anomalias
+  if (document.getElementById('rptHuerfanos'))    document.getElementById('rptHuerfanos').textContent    = cntHu;
+  if (document.getElementById('rptO365Mobile'))  document.getElementById('rptO365Mobile').textContent   = cntO365;
+  if (document.getElementById('rptCorreccion'))  document.getElementById('rptCorreccion').textContent   = cntCorr;
+  if (document.getElementById('rptRegisteredMdm')) document.getElementById('rptRegisteredMdm').textContent = cntRM;
+}
+
+// ---- ENTRA panel generico ----
 function showEntraPanel(tipo) {
   var titles = {
-    'all':        'Todos los Dispositivos Entra ID',
-    'haadj':      'Dispositivos Hibridos (HAADJ)',
-    'aadj':       'Dispositivos Entra puro (AADJ)',
-    'risky':      'Identidades en Riesgo',
-    'ca':         'Todas las Politicas de Acceso Condicional',
-    'ca-enabled': 'Politicas de Acceso Condicional Activas'
+    'all':                  'Todos los Dispositivos Entra ID',
+    'haadj':                'Dispositivos Hibridos (HAADJ)',
+    'aadj':                 'Dispositivos Entra puro (AADJ)',
+    'registered':           'Dispositivos Registered con MDM',
+    'huerfanos':            'Dispositivos Huerfanos',
+    'o365mobile':           'Dispositivos Office 365 Mobile',
+    'reg-sin-mdm':          'Registered sin MDM (actividad reciente)',
+    'obsoletos-entra':      'Dispositivos Obsoletos Entra (sin actividad > 6 meses)',
+    'correccion-identidad': 'Correccion de Identidad (MDM registrado, sin fecha de registro)',
+    'solo-mde':             'Dispositivos solo gestionados por MDE (Defender)',
+    'dup-entra':            'Dispositivos Duplicados en Entra ID (mismo nombre)',
   };
 
-  // Ocultar panel de dispositivos Entra
   document.getElementById('entraDevPanel').style.display = 'none';
 
   if (tipo === 'risky') {
-    // Scroll al panel de riesgos que ya esta visible
     document.getElementById('riskyPanel').scrollIntoView({ behavior:'smooth', block:'start' });
+    return;
+  }
 
-  } else if (tipo === 'ca' || tipo === 'ca-enabled') {
-    // Ir a la pestana de acceso condicional y filtrar
-    var tabEl = document.querySelector('.tab:nth-child(3)');
-    switchTab('actividad', tabEl);
-    var filtered = tipo === 'ca-enabled'
-      ? DATA.ca.filter(function(p) { return p.state === 'enabled'; })
-      : DATA.ca;
-    document.getElementById('caTitle').textContent = titles[tipo];
-    document.getElementById('caCount').textContent = filtered.length + ' politicas';
-    renderCA(filtered);
 
-  } else {
-    var filtered;
-    if (tipo === 'haadj') {
-      filtered = DATA.entra.filter(function(d) { return d.trustType === 'ServerAd'; });
-    } else if (tipo === 'aadj') {
-      filtered = DATA.entra.filter(function(d) { return d.trustType === 'AzureAd'; });
-    } else {
-      filtered = DATA.entra;
+  var devs = DATA.entra || [];
+  var filtered;
+  if      (tipo === 'haadj')           filtered = devs.filter(function(d){ return d.trustType === 'ServerAd'; });
+  else if (tipo === 'aadj')            filtered = devs.filter(function(d){ return d.trustType === 'AzureAd'; });
+  else if (tipo === 'registered')      filtered = devs.filter(isRegisteredMdm);
+  else if (tipo === 'huerfanos')       filtered = devs.filter(isHuerfano);
+  else if (tipo === 'o365mobile')      filtered = devs.filter(isO365Mobile);
+  else if (tipo === 'reg-sin-mdm')     filtered = devs.filter(isRegisteredSinMdm);
+  else if (tipo === 'obsoletos-entra')      filtered = devs.filter(isObsoletoEntra);
+  else if (tipo === 'correccion-identidad') filtered = devs.filter(isCorreccionIdentidad);
+  else if (tipo === 'solo-mde')             filtered = devs.filter(isSoloMde);
+  else if (tipo === 'dup-entra') {
+    showEntraDuplicatesPanel();
+    return;
+  }
+  else                                       filtered = devs;
+
+  currentEntraData = filtered;
+  entraActivePlatFilter = 'all';
+  entraShowDaysCol = (tipo === 'obsoletos-entra');
+  var thDias = document.getElementById('thDiasSinActividad');
+  if (thDias) thDias.style.display = entraShowDaysCol ? '' : 'none';
+  document.querySelectorAll('#entraFilterPlatBtns .ver-plat-btn').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.plat === 'all');
+  });
+  document.getElementById('entraDevTitle').textContent = titles[tipo] || tipo;
+  document.getElementById('entraDevCount').textContent = filtered.length + ' dispositivos';
+  document.getElementById('searchEntra').value = '';
+  updateEntraView(filtered);
+  var panel = document.getElementById('entraDevPanel');
+  panel.style.display = 'block';
+  panel.scrollIntoView({ behavior:'smooth', block:'start' });
+}
+
+function renderEntraPage() {
+  var tbody = document.getElementById('entraTableBody');
+  var totalPages = Math.ceil(filteredEntraData.length / PAGE_SIZE) || 1;
+  var start = (entraPage - 1) * PAGE_SIZE;
+  var pageData = filteredEntraData.slice(start, start + PAGE_SIZE);
+  var trustMap = { 'ServerAd':'Hibrida (HAADJ)', 'AzureAd':'Entra (AADJ)', 'Workplace':'Registered' };
+
+  document.getElementById('pageIndicator').textContent = 'Pagina ' + entraPage + ' de ' + totalPages;
+  document.getElementById('prevPage').disabled = (entraPage === 1);
+  document.getElementById('nextPage').disabled = (entraPage === totalPages);
+  document.getElementById('prevPage').style.opacity = (entraPage === 1) ? '0.4' : '1';
+  document.getElementById('nextPage').style.opacity = (entraPage === totalPages) ? '0.4' : '1';
+
+  var colSpan = entraShowDaysCol ? 9 : 8;
+  if (pageData.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="' + colSpan + '" style="text-align:center; color:var(--muted); padding:24px; font-family:var(--mono)">Sin datos de Entra ID</td></tr>';
+    return;
+  }
+
+  // Etiqueta MDM legible
+  function mdmLabel(d) {
+    if (isO365Mobile(d)) return '<span class="badge badge-warning">Office365Mobile</span>';
+    if (d.mdmAppId && d.mdmAppId !== '') return '<span class="badge badge-info" title="' + d.mdmAppId + '">MDM</span>';
+    return '<span class="badge badge-muted">Sin MDM</span>';
+  }
+
+  var now = Date.now();
+  tbody.innerHTML = pageData.map(function(d) {
+    var staleEntra = isObsoletoEntra(d);
+    var diasCell = '';
+    if (entraShowDaysCol) {
+      var signInMs = d.lastSignIn ? new Date(d.lastSignIn).getTime() : 0;
+      var dias = signInMs ? Math.floor((now - signInMs) / 86400000) : 9999;
+      var diasColor = dias > 365 ? 'var(--red)' : dias > 180 ? 'var(--orange)' : 'var(--muted)';
+      var diasTxt = signInMs ? dias + 'd' : 'Sin registro';
+      diasCell = '<td style="font-family:var(--mono); font-size:12px; font-weight:700; color:' + diasColor + '">' + diasTxt + '</td>';
     }
-    currentEntraData = filtered;
-    document.getElementById('entraDevTitle').textContent = titles[tipo];
-    document.getElementById('entraDevCount').textContent = filtered.length + ' dispositivos';
-    document.getElementById('searchEntra').value = '';
-    updateEntraView(filtered);
-    var panel = document.getElementById('entraDevPanel');
-    panel.style.display = 'block';
-    panel.scrollIntoView({ behavior:'smooth', block:'start' });
+    return '<tr' + (staleEntra ? ' style="opacity:0.65"' : '') + '>' +
+      '<td style="font-weight:600">' + (d.displayName || '-') + '</td>' +
+      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + (d.operatingSystem || '-') + '</td>' +
+      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + (d.osVersion || '-') + '</td>' +
+      '<td style="font-size:11px; color:var(--muted)">' + (trustMap[d.trustType] || d.trustType || '-') + '</td>' +
+      '<td>' + mdmLabel(d) + '</td>' +
+      '<td>' + (d.isManaged ? '<span class="badge badge-compliant">Si</span>' : '<span class="badge badge-muted">No</span>') + '</td>' +
+      '<td>' + (d.isCompliant ? '<span class="badge badge-compliant">Si</span>' : '<span class="badge badge-muted">No</span>') + '</td>' +
+      '<td style="font-family:var(--mono); font-size:11px; color:' + (staleEntra ? 'var(--red)' : 'var(--muted)') + '">' + fmtDate(d.lastSignIn) + '</td>' +
+      diasCell +
+      '</tr>';
+  }).join('');
+}
+
+// ---- INTUNE OBSOLETOS (sync > 3 meses) ----
+var intuneStaleAll = [];
+var intuneStaleFilt = [];
+var intuneStalePageN = 1;
+
+function initIntuneStale() {
+  var all = [].concat(DATA.windows||[], DATA.android||[], DATA.ios||[], DATA.macos||[]);
+  var now = Date.now();
+  intuneStaleAll = all.filter(function(d) {
+    if (!d.lastSyncDateTime || d.lastSyncDateTime === '') return true;
+    return (now - new Date(d.lastSyncDateTime).getTime()) > THREE_MONTHS_MS;
+  }).sort(function(a, b) {
+    var ta = a.lastSyncDateTime ? new Date(a.lastSyncDateTime).getTime() : 0;
+    var tb = b.lastSyncDateTime ? new Date(b.lastSyncDateTime).getTime() : 0;
+    return ta - tb; // mas antiguos primero
+  });
+
+  var cnt = intuneStaleAll.length;
+  document.getElementById('intuneStaleCount').textContent   = cnt;
+  document.getElementById('intuneStaleSubtitle').textContent = 'sin sincronizar en mas de 90 dias';
+  document.getElementById('intuneStaleBadge').textContent    = cnt + ' dispositivos';
+}
+
+function showIntuneStalePanel() {
+  intuneStaleFilt = intuneStaleAll.slice();
+  intuneStalePageN = 1;
+  document.getElementById('intuneStalePanelCount').textContent = intuneStaleFilt.length + ' dispositivos';
+  document.getElementById('searchIntuneStale').value = '';
+  renderIntuneStale();
+  var panel = document.getElementById('intuneStalePanel');
+  panel.style.display = 'block';
+  panel.scrollIntoView({ behavior:'smooth', block:'start' });
+}
+
+function filterIntuneStale() {
+  var q = document.getElementById('searchIntuneStale').value.toLowerCase();
+  intuneStaleFilt = intuneStaleAll.filter(function(d) {
+    return (d.deviceName||'').toLowerCase().indexOf(q) >= 0 ||
+           (d.userPrincipalName||'').toLowerCase().indexOf(q) >= 0 ||
+           (d.operatingSystem||'').toLowerCase().indexOf(q) >= 0;
+  });
+  intuneStalePageN = 1;
+  document.getElementById('intuneStalePanelCount').textContent = intuneStaleFilt.length + ' dispositivos';
+  renderIntuneStale();
+}
+
+function renderIntuneStale() {
+  var tbody = document.getElementById('intuneStaleBody');
+  var totalPages = Math.ceil(intuneStaleFilt.length / PAGE_SIZE) || 1;
+  var start = (intuneStalePageN - 1) * PAGE_SIZE;
+  var pageData = intuneStaleFilt.slice(start, start + PAGE_SIZE);
+  var now = Date.now();
+
+  document.getElementById('intuneStaleIndicator').textContent = 'Pagina ' + intuneStalePageN + ' de ' + totalPages;
+  document.getElementById('intuneStalePrev').disabled = (intuneStalePageN === 1);
+  document.getElementById('intuneStaleNext').disabled = (intuneStalePageN === totalPages);
+  document.getElementById('intuneStalePrev').style.opacity = (intuneStalePageN === 1) ? '0.4' : '1';
+  document.getElementById('intuneStaleNext').style.opacity = (intuneStalePageN === totalPages) ? '0.4' : '1';
+
+  if (pageData.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:var(--muted); padding:24px; font-family:var(--mono)">Sin dispositivos obsoletos</td></tr>';
+    return;
+  }
+  tbody.innerHTML = pageData.map(function(d) {
+    var syncMs   = d.lastSyncDateTime ? new Date(d.lastSyncDateTime).getTime() : 0;
+    var diasSinc = syncMs ? Math.floor((now - syncMs) / 86400000) : 999;
+    var diasColor = diasSinc > 180 ? 'var(--red)' : diasSinc > 90 ? 'var(--orange)' : 'var(--muted)';
+    return '<tr>' +
+      '<td style="font-weight:600">' + (d.deviceName||'-') + '</td>' +
+      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + (d.userPrincipalName||'-') + '</td>' +
+      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + (d.operatingSystem||'-') + '</td>' +
+      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + (d.osVersion||'-') + '</td>' +
+      '<td>' + badge(d.complianceState) + '</td>' +
+      '<td style="font-family:var(--mono); font-size:11px; color:var(--orange)">' + fmtDate(d.lastSyncDateTime) + '</td>' +
+      '<td style="font-family:var(--mono); font-size:12px; font-weight:700; color:' + diasColor + '">' + diasSinc + 'd</td>' +
+      '</tr>';
+  }).join('');
+}
+
+function changeIntuneStale(step) {
+  var totalPages = Math.ceil(intuneStaleFilt.length / PAGE_SIZE) || 1;
+  var np = intuneStalePageN + step;
+  if (np >= 1 && np <= totalPages) {
+    intuneStalePageN = np;
+    renderIntuneStale();
+    document.getElementById('intuneStalePanel').scrollIntoView({ behavior:'smooth', block:'start' });
   }
 }
 
@@ -1381,7 +2263,10 @@ function exportCSV() {
 }
 
 function copyReport() {
-  var txt = 'ASSESSMENT - $nombreCliente\nFecha: $fechaReporte\n--------------------------\nINTUNE\n  Total: $cntTotal dispositivos\n  Windows: $cntWin ($compWin% cumplimiento)\n  Android: $cntAndroid ($compAndroid% cumplimiento)\n  iOS: $cntiOS ($compiOS% cumplimiento)\n  macOS: $cntMac ($compMac% cumplimiento)\n  Cumplimiento Global: $compGlobal%\n\nENTRA ID\n  Total registrados: $cntEntraNum\n  Hibrida (HAADJ): $cntHAADJ\n  Entra puro (AADJ): $cntEntraAD\n  Identidades en riesgo: $cntRiskyU\n  Pol. Acceso Cond.: $cntCAPolNum ($cntCAPol_En habilitadas)';
+  var hu   = document.getElementById('rptHuerfanos')  ? document.getElementById('rptHuerfanos').textContent  : '-';
+  var o365 = document.getElementById('rptO365Mobile') ? document.getElementById('rptO365Mobile').textContent : '-';
+  var cor  = document.getElementById('rptCorreccion') ? document.getElementById('rptCorreccion').textContent : '-';
+  var txt = 'ASSESSMENT - $nombreCliente\nFecha: $fechaReporte\n--------------------------\nINTUNE\n  Total: $cntTotal dispositivos\n  Windows: $cntWin ($compWin% cumplimiento)\n  Android: $cntAndroid ($compAndroid% cumplimiento)\n  iOS: $cntiOS ($compiOS% cumplimiento)\n  macOS: $cntMac ($compMac% cumplimiento)\n  Cumplimiento Global: $compGlobal%\n\nENTRA ID\n  Total registrados: $cntEntraNum\n  Hibrida (HAADJ): $cntHAADJ\n  Entra puro (AADJ): $cntEntraAD\n  Identidades en riesgo: $cntRiskyU\n  Huerfanos: ' + hu + '\n  Office 365 Mobile: ' + o365 + '\n  Correccion Identidad: ' + cor;
   navigator.clipboard.writeText(txt).catch(function() { alert(txt); });
 }
 
@@ -1495,27 +2380,8 @@ function selectVerPlat(btn, platKey) {
 // OBSOLESCENCIA INTUNE
 // =====================================================================
 
-// --- Builds B oficiales de Microsoft (Patch Tuesday) por rama ---
-// Fuente: support.microsoft.com/windows-release-health  (actualizado abril 2026)
-// Formato: prefijo de 3 segmentos -> ultima build B publicada (sin OOB ni Preview)
-var WIN_LATEST = {
-  // Windows 11 25H2 / 24H2  (rama compartida 26100)
-  '10.0.26100': { build: '10.0.26100.8246', label: 'W11 24H2/25H2', eol: false,
-                  url: 'https://support.microsoft.com/topic/windows-11-version-24h2-update-history-0929c747-1815-4543-8461-0160d16f15e5' },
-  // Windows 11 26H1 / 25H2  (rama 26200 - misma KB que 26100)
-  '10.0.26200': { build: '10.0.26200.8246', label: 'W11 26H1',      eol: false,
-                  url: 'https://support.microsoft.com/topic/windows-11-version-26h1-update-history-253c73cd-cab1-4bfd-94dc-76c452273fc9' },
-  // Windows 11 23H2 / 22H2  (rama 22631/22621) - EoS junio 2025
-  '10.0.22631': { build: '10.0.22631.5189', label: 'W11 23H2 (EoS)', eol: true,
-                  url: 'https://support.microsoft.com/topic/windows-11-version-23h2-update-history-59875222-b990-4bd9-932f-91a5954de434' },
-  '10.0.22621': { build: '10.0.22621.5189', label: 'W11 22H2 (EoS)', eol: true,
-                  url: 'https://support.microsoft.com/topic/windows-11-version-22h2-update-history-ec4229c3-9184-4bd8-b4d1-97f83765a053' },
-  // Windows 10 22H2 - EoS octubre 2025 (ultima build B: octubre 2025)
-  '10.0.19045': { build: '10.0.19045.6456', label: 'W10 22H2 (EoS)', eol: true,
-                  url: 'https://support.microsoft.com/topic/windows-10-update-history-8127c2c6-6edf-4fdf-8b9f-0f7be1ef3562' },
-  '10.0.19044': { build: '10.0.19044.6456', label: 'W10 21H2 (EoS)', eol: true,
-                  url: 'https://support.microsoft.com/topic/windows-10-update-history-8127c2c6-6edf-4fdf-8b9f-0f7be1ef3562' },
-};
+// --- Builds B oficiales de Microsoft - generados automaticamente al ejecutar el script ---
+$WIN_LATEST_PLACEHOLDER$
 
 // Umbrales para Android/iOS/macOS
 var MIN_VERSIONS = {
@@ -1576,26 +2442,22 @@ function classifyDevice(d) {
   return 'old';
 }
 
-// --- Intentar obtener builds actuales desde aka.ms (best-effort, puede fallar por CORS) ---
-function tryFetchWinBuilds() {
-  // No hay un JSON publico limpio sin CORS; usamos los valores hardcoded arriba.
-  // Si en el futuro se expone un endpoint compatible, conectar aqui.
-}
-
 // --- Tipo de gestion ---
 // managementAgent values: mdm, easMdm, configurationManagerClientMdm,
 // configurationManagerClient, jamf, googleCloudDevicePolicyController, msSense, etc.
 var MGMT_GROUPS = [
-  { key: 'mdm',      label: 'MDM puro (Intune)',       color: '#63b3ed',
+  { key: 'mdm',      label: 'Intune',       color: '#63b3ed',
     match: function(a) { return a === 'mdm' || a === 'easmdm' || a === 'easMdm'; } },
   { key: 'sccm',     label: 'Co-management (SCCM+MDM)', color: '#f6ad55',
     match: function(a) { return a === 'configurationManagerClientMdm' || a === 'configurationManagerClientMdmEas'; } },
   { key: 'sccmonly', label: 'SCCM / ConfigMgr solo',   color: '#fc8181',
     match: function(a) { return a === 'configurationManagerClient'; } },
-  { key: 'mde',      label: 'MDE (Defender ATP)',       color: '#a78bfa',
+  { key: 'mde',      label: 'MDE',       color: '#a78bfa',
     match: function(a) { return a === 'msSense'; } },
   { key: 'jamf',     label: 'Jamf',                    color: '#4fd1c5',
     match: function(a) { return a === 'jamf'; } },
+  { key: 'gcp',      label: 'Android Enterprise (Intune)', color: '#68d391',
+    match: function(a) { return a === 'googleCloudDevicePolicyController'; } },
   { key: 'other',    label: 'Otro / Desconocido',       color: '#64748b',
     match: function(a) { return true; } } // catch-all
 ];
@@ -1617,7 +2479,11 @@ var obsFilteredData = [];
 var obsPage = 1;
 
 function initObsolescencia() {
-  var all = [].concat(DATA.windows||[], DATA.android||[], DATA.ios||[], DATA.macos||[]);
+  // Solo Windows gestionados por Intune (MDM puro o co-management)
+  var intuneAgents = ['mdm','easmdm','easMdm','configurationManagerClientMdm','configurationManagerClientMdmEas'];
+  var all = (DATA.windows||[]).filter(function(d) {
+    return intuneAgents.indexOf((d.managementAgent||'').trim()) >= 0;
+  });
   var current = [], warn = [], old = [];
   all.forEach(function(d) {
     var c = classifyDevice(d);
@@ -1638,17 +2504,28 @@ function initObsolescencia() {
   document.getElementById('obsLblWarn').textContent    = 'Riesgo ' + Math.round(warn.length/total*100) + '%';
   document.getElementById('obsLblOld').textContent     = 'Obs. ' + Math.round(old.length/total*100) + '%';
 
-  // --- Tarjeta tipo de gestion ---
+  // --- Tarjeta tipo de gestion (todos los dispositivos, 3 tipos fijos) ---
+  var MGMT_DISPLAY = [
+    { key: 'mde',  label: 'Defender (MDE)', color: '#a78bfa',
+      match: function(a) { return a === 'msSense'; } },
+    { key: 'mdm',  label: 'Intune (MDM)',   color: '#63b3ed',
+      match: function(a) { return a === 'mdm' || a === 'easMdm' || a === 'easmdm'; } },
+    { key: 'gcp',  label: 'Android Enterprise', color: '#68d391',
+      match: function(a) { return a === 'googleCloudDevicePolicyController'; } }
+  ];
+  var allDevices = [].concat(DATA.windows||[], DATA.android||[], DATA.ios||[], DATA.macos||[]);
   var mgmtCount = {};
-  all.forEach(function(d) {
-    var g = getMgmtGroup(d.managementAgent || '');
-    mgmtCount[g.key] = (mgmtCount[g.key] || 0) + 1;
+  allDevices.forEach(function(d) {
+    var agent = (d.managementAgent || '').trim();
+    MGMT_DISPLAY.forEach(function(g) { if (g.match(agent)) mgmtCount[g.key] = (mgmtCount[g.key]||0)+1; });
   });
+  var mgmtTotal = allDevices.length || 1;
   var mgmtHtml = '';
-  MGMT_GROUPS.forEach(function(g) {
+  MGMT_DISPLAY.forEach(function(g) {
     var cnt = mgmtCount[g.key] || 0;
     if (cnt === 0) return;
-    var pct = Math.round(cnt / total * 100);
+    var pct = Math.round(cnt / mgmtTotal * 100);
+    var total = mgmtTotal; // alias para compatibilidad con el bloque de renderizado siguiente
     mgmtHtml +=
       '<div onclick="showMgmtPanel(\'' + g.key + '\')" style="cursor:pointer; padding:6px 8px; border-radius:6px; transition:background .15s;" ' +
            'onmouseover="this.style.background=\'rgba(99,179,237,0.06)\'" onmouseout="this.style.background=\'transparent\'">' +
@@ -1667,9 +2544,13 @@ function initObsolescencia() {
 }
 
 function showObsPanel(filter) {
-  var all = [].concat(DATA.windows||[], DATA.android||[], DATA.ios||[], DATA.macos||[]);
+  // Solo Windows gestionados por Intune MDM puro (managementAgent === mdm)
+  var winMdm = (DATA.windows||[]).filter(function(d) {
+    var agent = (d.managementAgent || '').trim().toLowerCase();
+    return agent === 'mdm';
+  });
   var titles = { current: 'Dispositivos Actualizados', warn: 'Dispositivos en Riesgo', old: 'Dispositivos Obsoletos' };
-  obsFilteredData = all.filter(function(d) { return (d._obsClass || classifyDevice(d)) === filter; });
+  obsFilteredData = winMdm.filter(function(d) { return (d._obsClass || classifyDevice(d)) === filter; });
   obsPage = 1;
   document.getElementById('obsDetailTitle').textContent = titles[filter];
   document.getElementById('obsDetailCount').textContent = obsFilteredData.length + ' dispositivos';
@@ -1681,11 +2562,11 @@ function showObsPanel(filter) {
 
 function showMgmtPanel(mgmtKey) {
   var all = [].concat(DATA.windows||[], DATA.android||[], DATA.ios||[], DATA.macos||[]);
-  var group = MGMT_GROUPS.filter(function(g) { return g.key === mgmtKey; })[0];
+  var group = MGMT_DISPLAY.filter(function(g) { return g.key === mgmtKey; })[0];
   var label = group ? group.label : mgmtKey;
-  obsFilteredData = all.filter(function(d) {
-    return getMgmtGroup(d.managementAgent || '').key === mgmtKey;
-  });
+  obsFilteredData = group ? all.filter(function(d) {
+    return group.match((d.managementAgent || '').trim());
+  }) : all;
   obsPage = 1;
   document.getElementById('obsDetailTitle').textContent = 'Dispositivos - ' + label;
   document.getElementById('obsDetailCount').textContent = obsFilteredData.length + ' dispositivos';
@@ -1738,11 +2619,790 @@ function changeObsPage(step) {
   }
 }
 
+// =====================================================================
+// DISPOSITIVOS DUPLICADOS POR NUMERO DE SERIE
+// =====================================================================
+var dupAllGroups = [];
+var dupFilteredGroups = [];
+var dupPage = 1;
+
+function initDuplicates() {
+  var all = [].concat(DATA.windows||[], DATA.android||[], DATA.ios||[], DATA.macos||[]);
+
+  // Agrupar por serialNumber (ignorar vacios/unknown)
+  var serialMap = {};
+  all.forEach(function(d) {
+    var sn = (d.serialNumber || '').trim();
+    if (!sn || sn.toLowerCase() === 'unknown') return;
+    if (!serialMap[sn]) serialMap[sn] = [];
+    serialMap[sn].push(d);
+  });
+
+  // Construir grupos con mas de un dispositivo
+  dupAllGroups = Object.keys(serialMap)
+    .filter(function(sn) { return serialMap[sn].length > 1; })
+    .map(function(sn) {
+      var devs = serialMap[sn];
+      var owners = devs.map(function(d) { return d.userPrincipalName || '-'; })
+                       .filter(function(u, i, a) { return a.indexOf(u) === i; });
+      return {
+        serialNumber: sn,
+        count:        devs.length,
+        owners:       owners,
+        devices:      devs
+      };
+    });
+
+  // Ordenar por mayor numero de duplicados primero
+  dupAllGroups.sort(function(a, b) { return b.count - a.count; });
+
+  var totalSNs  = dupAllGroups.length;
+  var totalDevs = dupAllGroups.reduce(function(s, g) { return s + g.count; }, 0);
+
+  // Actualizar tarjeta KPI
+  document.getElementById('dupCount').textContent    = totalSNs;
+  document.getElementById('dupSubtitle').textContent = totalDevs + ' registros afectados en ' + totalSNs + ' numeros de serie';
+  document.getElementById('dupBadge').textContent    = totalSNs > 0 ? totalSNs + ' duplicados' : 'Sin duplicados';
+}
+
+function showDuplicatesPanel() {
+  dupFilteredGroups = dupAllGroups.slice();
+  dupPage = 1;
+  document.getElementById('dupPanelCount').textContent = dupFilteredGroups.length + ' series duplicadas';
+  document.getElementById('searchDup').value = '';
+  renderDupPage();
+  var panel = document.getElementById('duplicatesPanel');
+  panel.style.display = 'block';
+  panel.scrollIntoView({ behavior:'smooth', block:'start' });
+}
+
+function filterDuplicates() {
+  var q = document.getElementById('searchDup').value.toLowerCase();
+  dupFilteredGroups = dupAllGroups.filter(function(g) {
+    var ownerStr = g.owners.join(' ').toLowerCase();
+    var devNames = g.devices.map(function(d){ return d.deviceName||''; }).join(' ').toLowerCase();
+    return g.serialNumber.toLowerCase().indexOf(q) >= 0 ||
+           ownerStr.indexOf(q) >= 0 ||
+           devNames.indexOf(q) >= 0;
+  });
+  dupPage = 1;
+  document.getElementById('dupPanelCount').textContent = dupFilteredGroups.length + ' series duplicadas';
+  renderDupPage();
+}
+
+function toggleDupGroup(sn) {
+  var safeId = sn.replace(/[^a-zA-Z0-9]/g,'_');
+  var rows = document.querySelectorAll('.dup-detail-' + safeId);
+  var btn  = document.getElementById('dup-btn-' + safeId);
+  if (!rows.length) return;
+  var isOpen = rows[0].style.display !== 'none';
+  rows.forEach(function(r) { r.style.display = isOpen ? 'none' : ''; });
+  if (btn) btn.innerHTML = isOpen ? '&#9654;' : '&#9660;';
+}
+
+function renderDupPage() {
+  var tbody = document.getElementById('dupTableBody');
+  var totalPages = Math.ceil(dupFilteredGroups.length / PAGE_SIZE) || 1;
+  var start  = (dupPage - 1) * PAGE_SIZE;
+  var pageData = dupFilteredGroups.slice(start, start + PAGE_SIZE);
+
+  document.getElementById('dupPageIndicator').textContent = 'Pagina ' + dupPage + ' de ' + totalPages;
+  document.getElementById('dupPrevPage').disabled = (dupPage === 1);
+  document.getElementById('dupNextPage').disabled = (dupPage === totalPages);
+  document.getElementById('dupPrevPage').style.opacity = (dupPage === 1) ? '0.4' : '1';
+  document.getElementById('dupNextPage').style.opacity = (dupPage === totalPages) ? '0.4' : '1';
+
+  if (pageData.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color:var(--muted); padding:24px; font-family:var(--mono)">No hay dispositivos duplicados</td></tr>';
+    return;
+  }
+
+  var html = '';
+  pageData.forEach(function(g) {
+    var safeId = g.serialNumber.replace(/[^a-zA-Z0-9]/g,'_');
+    var safeSN = g.serialNumber.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+    var countColor = g.count >= 3 ? 'var(--red)' : 'var(--orange)';
+    var ownersHtml = g.owners.map(function(o) {
+      return '<span style="display:inline-block; background:rgba(99,179,237,0.08); border:1px solid rgba(99,179,237,0.2); border-radius:4px; padding:2px 7px; font-size:10px; margin:2px 2px 2px 0; font-family:var(--mono); color:var(--blue)">' + o + '</span>';
+    }).join('');
+
+    // Fila resumen del grupo (clickable)
+    html += '<tr style="cursor:pointer; background:rgba(99,179,237,0.03);" onclick="toggleDupGroup(\'' + safeSN + '\')">' +
+      '<td style="width:32px; text-align:center; font-size:14px; color:var(--blue); user-select:none;"><span id="dup-btn-' + safeId + '">&#9654;</span></td>' +
+      '<td><span style="font-family:var(--mono); font-weight:600; font-size:12px; color:var(--text)">' + g.serialNumber + '</span></td>' +
+      '<td style="text-align:left"><span class="badge" style="background:rgba(252,129,129,0.12); color:' + countColor + '; font-size:13px; font-weight:700">' + g.count + 'x</span></td>' +
+      '<td>' + ownersHtml + '</td>' +
+      '</tr>';
+
+    // Filas de detalle (colapsables, se identifican por clase CSS)
+    // Cabecera de detalle
+    html += '<tr class="dup-detail-' + safeId + '" style="display:none; background:rgba(26,34,53,0.7);">' +
+      '<td></td>' +
+      '<td colspan="3" style="padding:0;">' +
+        '<table style="width:100%; border-collapse:collapse; font-size:11px;">' +
+        '<thead><tr>' +
+          '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:left; padding:8px 12px 6px; border-bottom:1px solid var(--border);">Nombre</th>' +
+          '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:left; padding:8px 12px 6px; border-bottom:1px solid var(--border);">Propietario</th>' +
+          '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:left; padding:8px 12px 6px; border-bottom:1px solid var(--border);">Cumplimiento</th>' +
+          '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:left; padding:8px 12px 6px; border-bottom:1px solid var(--border);">Fecha Inscripcion</th>' +
+          '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:left; padding:8px 12px 6px; border-bottom:1px solid var(--border);">Ultima Sincro</th>' +
+        '</tr></thead>' +
+        '<tbody>';
+    g.devices.forEach(function(d, idx) {
+      var isLast = idx === g.devices.length - 1;
+      html +=
+        '<tr style="' + (isLast ? '' : 'border-bottom:1px solid rgba(255,255,255,0.04)') + '">' +
+        '<td style="padding:8px 12px; font-weight:600; color:var(--text)">' + (d.deviceName||'-') + '</td>' +
+        '<td style="padding:8px 12px; font-family:var(--mono); color:var(--muted)">' + (d.userPrincipalName||'-') + '</td>' +
+        '<td style="padding:8px 12px">' + badge(d.complianceState) + '</td>' +
+        '<td style="padding:8px 12px; font-family:var(--mono); color:var(--muted)">' + fmtDate(d.enrolledDateTime) + '</td>' +
+        '<td style="padding:8px 12px; font-family:var(--mono); color:var(--muted)">' + fmtDate(d.lastSyncDateTime) + '</td>' +
+        '</tr>';
+    });
+    // Fila de cierre del subtable (misma clase para colapsar junto)
+    html += '</tbody></table></td></tr>';
+  });
+
+  tbody.innerHTML = html;
+}
+
+function changeDupPage(step) {
+  var totalPages = Math.ceil(dupFilteredGroups.length / PAGE_SIZE) || 1;
+  var newPage = dupPage + step;
+  if (newPage >= 1 && newPage <= totalPages) {
+    dupPage = newPage;
+    renderDupPage();
+    document.getElementById('duplicatesPanel').scrollIntoView({ behavior:'smooth', block:'start' });
+  }
+}
+
+// =====================================================================
+// DUPLICADOS ENTRA ID (agrupados por displayName)
+// =====================================================================
+var entraDupAllGroups  = [];
+var entraDupFiltered   = [];
+var entraDupPage       = 1;
+
+function initEntraDuplicates() {
+  var nameMap = {};
+  (DATA.entra || []).forEach(function(d) {
+    var n = (d.displayName || '').trim();
+    if (!n) return;
+    var k = n.toLowerCase();
+    if (!nameMap[k]) nameMap[k] = { displayName: n, devices: [] };
+    nameMap[k].devices.push(d);
+  });
+
+  entraDupAllGroups = Object.keys(nameMap)
+    .filter(function(k) { return nameMap[k].devices.length > 1; })
+    .map(function(k) {
+      var devs = nameMap[k].devices;
+      var trustTypes = devs.map(function(d) { return d.trustType || 'Sin tipo'; })
+                           .filter(function(v, i, a) { return a.indexOf(v) === i; });
+      return {
+        displayName: nameMap[k].displayName,
+        count:       devs.length,
+        trustTypes:  trustTypes,
+        devices:     devs
+      };
+    })
+    .sort(function(a, b) { return b.count - a.count; });
+
+  var totalNames = entraDupAllGroups.length;
+  var totalDevs  = entraDupAllGroups.reduce(function(s, g) { return s + g.count; }, 0);
+  if (document.getElementById('cntDupEntra'))
+    document.getElementById('cntDupEntra').textContent = totalNames;
+}
+
+function showEntraDuplicatesPanel() {
+  entraDupFiltered = entraDupAllGroups.slice();
+  entraDupPage = 1;
+  document.getElementById('entraDupPanelCount').textContent = entraDupFiltered.length + ' nombres duplicados';
+  document.getElementById('searchEntraDup').value = '';
+  renderEntraDupPage();
+  var panel = document.getElementById('entraDupPanel');
+  panel.style.display = 'block';
+  panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function filterEntraDuplicates() {
+  var q = document.getElementById('searchEntraDup').value.toLowerCase();
+  entraDupFiltered = entraDupAllGroups.filter(function(g) {
+    var trustStr = g.trustTypes.join(' ').toLowerCase();
+    var propStr  = g.devices.map(function(d) { return d.displayName || ''; }).join(' ').toLowerCase();
+    return g.displayName.toLowerCase().indexOf(q) >= 0 ||
+           trustStr.indexOf(q) >= 0 ||
+           propStr.indexOf(q) >= 0;
+  });
+  entraDupPage = 1;
+  document.getElementById('entraDupPanelCount').textContent = entraDupFiltered.length + ' nombres duplicados';
+  renderEntraDupPage();
+}
+
+function toggleEntraDupGroup(name) {
+  var safeId = name.replace(/[^a-zA-Z0-9]/g, '_');
+  var rows = document.querySelectorAll('.entra-dup-detail-' + safeId);
+  var btn  = document.getElementById('entra-dup-btn-' + safeId);
+  if (!rows.length) return;
+  var isOpen = rows[0].style.display !== 'none';
+  rows.forEach(function(r) { r.style.display = isOpen ? 'none' : ''; });
+  if (btn) btn.innerHTML = isOpen ? '&#9654;' : '&#9660;';
+}
+
+var trustMap = { 'ServerAd': 'Hibrida (HAADJ)', 'AzureAd': 'Entra (AADJ)', 'Workplace': 'Registered' };
+function trustBadgeEntra(trustType) {
+  var labels = { 'ServerAd': 'HAADJ', 'AzureAd': 'AADJ', 'Workplace': 'Registered' };
+  var colors = { 'ServerAd': 'var(--cyan)', 'AzureAd': 'var(--purple)', 'Workplace': 'var(--green)' };
+  var lbl = labels[trustType] || (trustType || 'Sin tipo');
+  var col = colors[trustType] || 'var(--muted)';
+  return '<span class="badge" style="background:' + col + '22; color:' + col + '">' + lbl + '</span>';
+}
+
+function renderEntraDupPage() {
+  var tbody = document.getElementById('entraDupTableBody');
+  var totalPages = Math.ceil(entraDupFiltered.length / PAGE_SIZE) || 1;
+  var start    = (entraDupPage - 1) * PAGE_SIZE;
+  var pageData = entraDupFiltered.slice(start, start + PAGE_SIZE);
+
+  document.getElementById('entraDupPageIndicator').textContent = 'Pagina ' + entraDupPage + ' de ' + totalPages;
+  document.getElementById('entraDupPrevPage').disabled = (entraDupPage === 1);
+  document.getElementById('entraDupNextPage').disabled = (entraDupPage === totalPages);
+  document.getElementById('entraDupPrevPage').style.opacity = (entraDupPage === 1) ? '0.4' : '1';
+  document.getElementById('entraDupNextPage').style.opacity = (entraDupPage === totalPages) ? '0.4' : '1';
+
+  if (pageData.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color:var(--muted); padding:24px; font-family:var(--mono)">No hay dispositivos duplicados en Entra ID</td></tr>';
+    return;
+  }
+
+  var html = '';
+  pageData.forEach(function(g) {
+    var safeId    = g.displayName.replace(/[^a-zA-Z0-9]/g, '_');
+    var safeName  = g.displayName.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    var countColor = g.count >= 3 ? 'var(--red)' : 'var(--orange)';
+
+    // Badges de tipos de union presentes en el grupo
+    var trustsHtml = g.trustTypes.map(function(t) {
+      return trustBadgeEntra(t);
+    }).join(' ');
+
+    // Fila resumen del grupo (clickable)
+    html += '<tr style="cursor:pointer; background:rgba(99,179,237,0.03);" onclick="toggleEntraDupGroup(\'' + safeName + '\')">' +
+      '<td style="width:32px; text-align:center; font-size:14px; color:var(--blue); user-select:none;"><span id="entra-dup-btn-' + safeId + '">&#9654;</span></td>' +
+      '<td><span style="font-family:var(--mono); font-weight:600; font-size:12px; color:var(--text)">' + g.displayName + '</span></td>' +
+      '<td style="text-align:left"><span class="badge" style="background:rgba(252,129,129,0.12); color:' + countColor + '; font-size:13px; font-weight:700">' + g.count + 'x</span></td>' +
+      '<td>' + trustsHtml + '</td>' +
+      '</tr>';
+
+    // Filas de detalle colapsables
+    html += '<tr class="entra-dup-detail-' + safeId + '" style="display:none; background:rgba(26,34,53,0.7);">' +
+      '<td></td>' +
+      '<td colspan="3" style="padding:0;">' +
+        '<table style="width:100%; border-collapse:collapse; font-size:11px;">' +
+        '<thead><tr>' +
+          '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:left; padding:8px 12px 6px; border-bottom:1px solid var(--border);">Nombre</th>' +
+          '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:left; padding:8px 12px 6px; border-bottom:1px solid var(--border);">Tipo Union</th>' +
+          '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:left; padding:8px 12px 6px; border-bottom:1px solid var(--border);">Gestion</th>' +
+          '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:left; padding:8px 12px 6px; border-bottom:1px solid var(--border);">F. Registro</th>' +
+          '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:left; padding:8px 12px 6px; border-bottom:1px solid var(--border);">Ultimo Inicio Sesion</th>' +
+        '</tr></thead>' +
+        '<tbody>';
+    g.devices.forEach(function(d, idx) {
+      var isLast = idx === g.devices.length - 1;
+      var mgmtLbl = d.managementType || '-';
+      html +=
+        '<tr style="' + (isLast ? '' : 'border-bottom:1px solid rgba(255,255,255,0.04)') + '">' +
+        '<td style="padding:8px 12px; font-weight:600; color:var(--text)">'           + (d.displayName || '-')         + '</td>' +
+        '<td style="padding:8px 12px">'                                                + trustBadgeEntra(d.trustType)   + '</td>' +
+        '<td style="padding:8px 12px; font-family:var(--mono); font-size:10px; color:var(--muted)">' + mgmtLbl + '</td>' +
+        '<td style="padding:8px 12px; font-family:var(--mono); color:var(--muted)">'  + fmtDate(d.registrationDateTime) + '</td>' +
+        '<td style="padding:8px 12px; font-family:var(--mono); color:var(--muted)">'  + fmtDate(d.lastSignIn)           + '</td>' +
+        '</tr>';
+    });
+    html += '</tbody></table></td></tr>';
+  });
+
+  tbody.innerHTML = html;
+}
+
+function changeEntraDupPage(step) {
+  var totalPages = Math.ceil(entraDupFiltered.length / PAGE_SIZE) || 1;
+  var np = entraDupPage + step;
+  if (np >= 1 && np <= totalPages) {
+    entraDupPage = np;
+    renderEntraDupPage();
+    document.getElementById('entraDupPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+}
+
+// =====================================================================
+// TAB CUMPLIMIENTO
+// =====================================================================
+var cumplActivePlatform = 'all';
+var cumplDevAllData     = [];
+var cumplDevFiltered    = [];
+var cumplDevPage        = 1;
+
+var PLATFORM_COLORS = {
+  'Windows':           '#63b3ed',
+  'Windows Mobile':    '#90cdf4',
+  'Windows 8.1':       '#bee3f8',
+  'Android':           '#68d391',
+  'Android Enterprise':'#4fd1c5',
+  'iOS':               '#a78bfa',
+  'macOS':             '#f6ad55',
+  'Otro':              '#94a3b8'
+};
+
+function getPlatColor(platform) {
+  for (var k in PLATFORM_COLORS) {
+    if (platform && platform.toLowerCase().indexOf(k.toLowerCase()) >= 0) return PLATFORM_COLORS[k];
+  }
+  return '#64748b';
+}
+
+function cumplStatusBadge(status) {
+  var map = {
+    nonCompliant:  '<span class="badge badge-error">No Conforme</span>',
+    compliant:     '<span class="badge badge-compliant">Conforme</span>',
+    error:         '<span class="badge badge-error">Error</span>',
+    unknown:       '<span class="badge badge-muted">Desconocido</span>',
+    inGracePeriod: '<span class="badge badge-warning">Periodo Gracia</span>',
+    conflict:      '<span class="badge badge-warning">Conflicto</span>'
+  };
+  return map[status] || '<span class="badge badge-muted">' + (status||'-') + '</span>';
+}
+
+function setCumplFilter(platform, btn) {
+  document.querySelectorAll('#tab-cumplimiento .ver-plat-btn').forEach(function(b){ b.classList.remove('active'); });
+  if (btn && btn.classList && btn.classList.contains('ver-plat-btn')) btn.classList.add('active');
+  cumplActivePlatform = platform;
+  document.getElementById('cumplDevPanel').style.display = 'none';
+  renderCumplPolicies();
+}
+
+function initCumplimiento() {
+  var policies = DATA.compliancePolicies || [];
+
+  // ---- KPIs por plataforma ----
+  var platMap = {};
+  policies.forEach(function(p) {
+    var plat = p.platform || 'Otro';
+    if (!platMap[plat]) platMap[plat] = { compliant:0, nonCompliant:0, error:0, unknown:0, grace:0, policyCount:0 };
+    platMap[plat].policyCount  += 1;
+    platMap[plat].compliant    += p.compliantCount    || 0;
+    platMap[plat].nonCompliant += p.nonCompliantCount || 0;
+    platMap[plat].error        += p.errorCount        || 0;
+    platMap[plat].unknown      += p.unknownCount      || 0;
+    platMap[plat].grace        += p.gracePeriodCount  || 0;
+  });
+
+  // Badge global en tab
+  var totalPolicies = policies.length;
+  var el = document.getElementById('tabBadgeCumpl');
+  if (el) el.textContent = totalPolicies + ' directivas';
+
+  // KPI cards
+  var kpiGrid = document.getElementById('cumplKpiGrid');
+  if (!kpiGrid) return;
+  if (Object.keys(platMap).length === 0) {
+    kpiGrid.innerHTML = '<div style="grid-column:span 5; font-family:var(--mono); font-size:12px; color:var(--muted); padding:20px; text-align:center;">Sin datos de directivas de cumplimiento (requiere DeviceManagementConfiguration.Read.All)</div>';
+    return;
+  }
+
+  var kpiHtml = '';
+  var platOrder = ['Windows','Windows 8.1','Windows Mobile','Android','Android Enterprise','iOS','macOS','Otro'];
+  var allPlats = platOrder.filter(function(p){ return platMap[p]; })
+                          .concat(Object.keys(platMap).filter(function(p){ return platOrder.indexOf(p) < 0; }));
+
+  allPlats.forEach(function(plat) {
+    var d = platMap[plat];
+    var total = d.compliant + d.nonCompliant + d.error + d.unknown + d.grace;
+    var pctOk = total > 0 ? Math.round(d.compliant/total*100) : 0;
+    var col = getPlatColor(plat);
+    var pctColor = pctOk >= 80 ? 'var(--green)' : pctOk >= 50 ? 'var(--orange)' : total > 0 ? 'var(--red)' : 'var(--muted)';
+    kpiHtml +=
+      '<div style="background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:18px; position:relative; overflow:hidden; cursor:pointer; transition:border-color .2s;" ' +
+           'onclick="setCumplFilter(\'' + plat + '\', this)" ' +
+           'onmouseover="this.style.borderColor=\'var(--border2)\'" onmouseout="this.style.borderColor=\'var(--border)\'">' +
+        '<div style="position:absolute;top:0;left:0;right:0;height:2px;background:' + col + ';opacity:.8;"></div>' +
+        '<div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:10px;">' +
+          '<div style="font-family:var(--mono); font-size:9px; letter-spacing:1.5px; text-transform:uppercase; color:var(--muted);">' + plat + '</div>' +
+          '<div style="font-family:var(--mono); font-size:9px; color:var(--muted); background:rgba(255,255,255,0.05); padding:2px 6px; border-radius:4px;">' + d.policyCount + ' dir.</div>' +
+        '</div>' +
+        '<div style="font-size:32px; font-weight:700; letter-spacing:-1px; color:' + pctColor + '; line-height:1; margin-bottom:4px;">' + (total > 0 ? pctOk + '%' : '-') + '</div>' +
+        '<div style="font-family:var(--mono); font-size:10px; color:var(--muted); margin-bottom:10px;">' + (total > 0 ? total + ' dispositivos' : 'Sin datos') + '</div>' +
+        '<div style="height:4px; background:rgba(255,255,255,0.06); border-radius:4px; overflow:hidden; margin-bottom:10px; display:flex;">' +
+          '<div style="height:100%; width:' + (total>0?Math.round(d.compliant/total*100):0) + '%; background:var(--green); border-radius:4px 0 0 4px;"></div>' +
+          '<div style="height:100%; width:' + (total>0?Math.round(d.nonCompliant/total*100):0) + '%; background:var(--red);"></div>' +
+          '<div style="height:100%; width:' + (total>0?Math.round((d.error+d.unknown+d.grace)/total*100):0) + '%; background:var(--orange); border-radius:0 4px 4px 0;"></div>' +
+        '</div>' +
+        '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
+          '<span style="font-family:var(--mono); font-size:9px; color:var(--green);">&#10003; ' + d.compliant + '</span>' +
+          '<span style="font-family:var(--mono); font-size:9px; color:var(--red);">&#x2715; ' + d.nonCompliant + '</span>' +
+          (d.error > 0 ? '<span style="font-family:var(--mono); font-size:9px; color:var(--orange);">! ' + d.error + '</span>' : '') +
+          (d.grace > 0 ? '<span style="font-family:var(--mono); font-size:9px; color:var(--muted);">~ ' + d.grace + '</span>' : '') +
+        '</div>' +
+      '</div>';
+  });
+  kpiGrid.innerHTML = kpiHtml;
+  kpiGrid.style.gridTemplateColumns = 'repeat(' + Math.min(allPlats.length, 5) + ',1fr)';
+
+  renderCumplPolicies();
+}
+
+function renderCumplPolicies() {
+  var container = document.getElementById('cumplPoliciesList');
+  if (!container) return;
+
+  var policies = (DATA.compliancePolicies || []).filter(function(p) {
+    if (cumplActivePlatform === 'all') return true;
+    return (p.platform || '').toLowerCase().indexOf(cumplActivePlatform.toLowerCase()) >= 0;
+  });
+
+  if (policies.length === 0) {
+    container.innerHTML = '<div style="font-family:var(--mono); font-size:12px; color:var(--muted); padding:20px; text-align:center;">Sin directivas para esta plataforma</div>';
+    return;
+  }
+
+  var html = '';
+  policies.forEach(function(pol) {
+    var col       = getPlatColor(pol.platform);
+    var total     = (pol.compliantCount||0) + (pol.nonCompliantCount||0) + (pol.errorCount||0) + (pol.unknownCount||0) + (pol.gracePeriodCount||0);
+    var pctOk     = total > 0 ? Math.round((pol.compliantCount||0)/total*100) : 0;
+    var polSafeId = pol.id.replace(/[^a-zA-Z0-9]/g,'_');
+
+    // Settings no conformes ordenadas de mayor a menor impacto
+    var badSettings = (pol.settings || [])
+      .filter(function(s){ return (s.nonCompliantCount||0) + (s.errorCount||0) + (s.conflictCount||0) > 0; })
+      .sort(function(a,b){ return ((b.nonCompliantCount||0)+(b.errorCount||0)) - ((a.nonCompliantCount||0)+(a.errorCount||0)); });
+
+    // Nombre legible del setting
+    function fmtSetting(name) {
+      return (name || '-')
+        .replace(/^.*\//,'')
+        .replace(/([A-Z])/g,' $1')
+        .replace(/^deviceCompliancePolicy\s*/i,'')
+        .trim();
+    }
+
+    html +=
+      '<div class="panel" style="margin-bottom:16px;">' +
+        '<div class="panel-header" style="cursor:pointer;" onclick="toggleCumplPolicy(\'' + polSafeId + '\')">' +
+          '<div style="display:flex; align-items:center; gap:12px; flex:1; min-width:0;">' +
+            '<span style="width:10px;height:10px;border-radius:50%;background:' + col + ';flex-shrink:0;display:inline-block;"></span>' +
+            '<div style="min-width:0;">' +
+              '<div style="font-size:13px; font-weight:600; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + (pol.displayName||'-') + '</div>' +
+              '<div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:2px;">' + (pol.platform||'-') + '</div>' +
+            '</div>' +
+          '</div>' +
+          '<div style="display:flex; align-items:center; gap:10px; flex-shrink:0;">' +
+            '<div style="text-align:right;">' +
+              '<div style="font-family:var(--mono); font-size:18px; font-weight:700; color:' + (pctOk >= 80 ? 'var(--green)' : pctOk >= 50 ? 'var(--orange)' : 'var(--red)') + ';">' + pctOk + '%</div>' +
+              '<div style="font-family:var(--mono); font-size:9px; color:var(--muted);">' + total + ' disp.</div>' +
+            '</div>' +
+            '<div style="display:flex; flex-direction:column; gap:3px; min-width:120px;">' +
+              '<div style="height:5px; background:rgba(255,255,255,0.06); border-radius:3px; overflow:hidden; display:flex;">' +
+                '<div style="height:100%; width:' + pctOk + '%; background:var(--green);"></div>' +
+                '<div style="height:100%; width:' + (total>0?Math.round((pol.nonCompliantCount||0)/total*100):0) + '%; background:var(--red);"></div>' +
+                '<div style="height:100%; width:' + (total>0?Math.round(((pol.errorCount||0)+(pol.unknownCount||0)+(pol.gracePeriodCount||0))/total*100):0) + '%; background:var(--orange);"></div>' +
+              '</div>' +
+              '<div style="display:flex; gap:8px;">' +
+                '<span style="font-family:var(--mono); font-size:9px; color:var(--green);">&#10003; ' + (pol.compliantCount||0) + '</span>' +
+                '<span style="font-family:var(--mono); font-size:9px; color:var(--red);">&#x2715; ' + (pol.nonCompliantCount||0) + '</span>' +
+                (pol.errorCount > 0 ? '<span style="font-family:var(--mono); font-size:9px; color:var(--orange);">! ' + pol.errorCount + '</span>' : '') +
+                (pol.gracePeriodCount > 0 ? '<span style="font-family:var(--mono); font-size:9px; color:var(--muted);">~ ' + pol.gracePeriodCount + '</span>' : '') +
+              '</div>' +
+            '</div>' +
+            '<span style="font-family:var(--mono); font-size:14px; color:var(--muted);" id="cumpl-arrow-' + polSafeId + '">&#9654;</span>' +
+          '</div>' +
+        '</div>' +
+
+        // Cuerpo colapsable
+        '<div id="cumpl-body-' + polSafeId + '" style="display:none;">' +
+          '<div style="padding:16px 20px; border-bottom:1px solid var(--border); display:flex; gap:10px; flex-wrap:wrap; align-items:center;">' +
+            '<span style="font-family:var(--mono); font-size:10px; color:var(--muted);">Settings no conformes:</span>' +
+            (badSettings.length === 0 ?
+              '<span style="font-family:var(--mono); font-size:11px; color:var(--green);">Sin settings incumplidos &#10003;</span>' :
+              '<span style="font-family:var(--mono); font-size:10px; color:var(--muted);">' + badSettings.length + ' settings con incumplimientos</span>') +
+            (pol.devices && pol.devices.length > 0 ?
+              '<button class="export-btn" style="font-size:10px; padding:4px 10px; margin-left:auto;" onclick="showCumplDevPanel(\'' + polSafeId + '\')">Ver ' + pol.devices.length + ' dispositivos &#x2192;</button>' : '') +
+          '</div>' +
+
+          // Tabla de settings
+          (badSettings.length > 0 ?
+            '<div style="overflow-x:auto;">' +
+            '<table style="width:100%; border-collapse:collapse; font-size:12px;">' +
+              '<thead><tr>' +
+                '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:left; padding:10px 16px 8px; border-bottom:1px solid var(--border);">Setting</th>' +
+                '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:center; padding:10px 12px 8px; border-bottom:1px solid var(--border); width:90px;">No Conforme</th>' +
+                '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:center; padding:10px 12px 8px; border-bottom:1px solid var(--border); width:80px;">Error</th>' +
+                '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:center; padding:10px 12px 8px; border-bottom:1px solid var(--border); width:80px;">Conflicto</th>' +
+                '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:left; padding:10px 12px 8px; border-bottom:1px solid var(--border);">Impacto</th>' +
+              '</tr></thead>' +
+              '<tbody>' +
+                badSettings.map(function(s) {
+                  var impact = (s.nonCompliantCount||0) + (s.errorCount||0) + (s.conflictCount||0);
+                  var impactPct = total > 0 ? Math.round(impact/total*100) : 0;
+                  var barCol = impactPct >= 50 ? 'var(--red)' : impactPct >= 20 ? 'var(--orange)' : 'var(--muted)';
+                  return '<tr style="border-bottom:1px solid rgba(255,255,255,0.04);">' +
+                    '<td style="padding:10px 16px; color:var(--text); max-width:300px;">' +
+                      '<div style="font-weight:500; font-size:12px;">' + fmtSetting(s.settingName) + '</div>' +
+                      '<div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:2px; word-break:break-all;">' + (s.settingName||'') + '</div>' +
+                    '</td>' +
+                    '<td style="padding:10px 12px; text-align:center;">' +
+                      (s.nonCompliantCount > 0 ? '<span style="font-family:var(--mono); font-size:13px; font-weight:700; color:var(--red);">' + s.nonCompliantCount + '</span>' : '<span style="color:var(--muted);">-</span>') +
+                    '</td>' +
+                    '<td style="padding:10px 12px; text-align:center;">' +
+                      (s.errorCount > 0 ? '<span style="font-family:var(--mono); font-size:13px; font-weight:700; color:var(--orange);">' + s.errorCount + '</span>' : '<span style="color:var(--muted);">-</span>') +
+                    '</td>' +
+                    '<td style="padding:10px 12px; text-align:center;">' +
+                      (s.conflictCount > 0 ? '<span style="font-family:var(--mono); font-size:13px; font-weight:700; color:var(--orange);">' + s.conflictCount + '</span>' : '<span style="color:var(--muted);">-</span>') +
+                    '</td>' +
+                    '<td style="padding:10px 12px;">' +
+                      '<div style="display:flex; align-items:center; gap:8px;">' +
+                        '<div style="flex:1; height:5px; background:rgba(255,255,255,0.06); border-radius:3px; overflow:hidden; min-width:60px;">' +
+                          '<div style="height:100%; width:' + impactPct + '%; background:' + barCol + '; border-radius:3px;"></div>' +
+                        '</div>' +
+                        '<span style="font-family:var(--mono); font-size:10px; color:' + barCol + '; min-width:32px; text-align:right;">' + impactPct + '%</span>' +
+                      '</div>' +
+                    '</td>' +
+                  '</tr>';
+                }).join('') +
+              '</tbody>' +
+            '</table></div>' : '') +
+        '</div>' +
+      '</div>';
+  });
+
+  // Guardar referencia para el panel de dispositivos
+  window._cumplPoliciesRendered = policies;
+  container.innerHTML = html;
+}
+
+function toggleCumplPolicy(safeId) {
+  var body  = document.getElementById('cumpl-body-' + safeId);
+  var arrow = document.getElementById('cumpl-arrow-' + safeId);
+  if (!body) return;
+  var isOpen = body.style.display !== 'none';
+  body.style.display  = isOpen ? 'none' : 'block';
+  if (arrow) arrow.innerHTML = isOpen ? '&#9654;' : '&#9660;';
+}
+
+function showCumplDevPanel(polSafeId) {
+  var policies = window._cumplPoliciesRendered || [];
+  var pol = policies.filter(function(p){ return p.id.replace(/[^a-zA-Z0-9]/g,'_') === polSafeId; })[0];
+  if (!pol) return;
+  cumplDevAllData  = pol.devices || [];
+  cumplDevFiltered = cumplDevAllData.slice();
+  cumplDevPage     = 1;
+  document.getElementById('cumplDevTitle').textContent = 'No conformes: ' + pol.displayName;
+  document.getElementById('cumplDevCount').textContent = cumplDevFiltered.length + ' dispositivos';
+  document.getElementById('searchCumplDev').value = '';
+  renderCumplDevPage();
+  var panel = document.getElementById('cumplDevPanel');
+  panel.style.display = 'block';
+  panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function filterCumplDevices() {
+  var q = document.getElementById('searchCumplDev').value.toLowerCase();
+  cumplDevFiltered = cumplDevAllData.filter(function(d) {
+    return (d.deviceName||'').toLowerCase().indexOf(q) >= 0 ||
+           (d.upn||'').toLowerCase().indexOf(q) >= 0;
+  });
+  cumplDevPage = 1;
+  document.getElementById('cumplDevCount').textContent = cumplDevFiltered.length + ' dispositivos';
+  renderCumplDevPage();
+}
+
+function renderCumplDevPage() {
+  var tbody = document.getElementById('cumplDevBody');
+  var totalPages = Math.ceil(cumplDevFiltered.length / PAGE_SIZE) || 1;
+  var start    = (cumplDevPage - 1) * PAGE_SIZE;
+  var pageData = cumplDevFiltered.slice(start, start + PAGE_SIZE);
+
+  document.getElementById('cumplDevPageInd').textContent = 'Pagina ' + cumplDevPage + ' de ' + totalPages;
+  document.getElementById('cumplDevPrev').disabled = (cumplDevPage === 1);
+  document.getElementById('cumplDevNext').disabled = (cumplDevPage === totalPages);
+  document.getElementById('cumplDevPrev').style.opacity = (cumplDevPage === 1) ? '0.4' : '1';
+  document.getElementById('cumplDevNext').style.opacity = (cumplDevPage === totalPages) ? '0.4' : '1';
+
+  if (pageData.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color:var(--muted); padding:20px; font-family:var(--mono)">Sin dispositivos</td></tr>';
+    return;
+  }
+  tbody.innerHTML = pageData.map(function(d) {
+    return '<tr>' +
+      '<td style="font-weight:600">' + (d.deviceName||'-') + '</td>' +
+      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + (d.upn||'-') + '</td>' +
+      '<td>' + cumplStatusBadge(d.status) + '</td>' +
+      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + fmtDate(d.lastReported) + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+function changeCumplDevPage(step) {
+  var totalPages = Math.ceil(cumplDevFiltered.length / PAGE_SIZE) || 1;
+  var np = cumplDevPage + step;
+  if (np >= 1 && np <= totalPages) {
+    cumplDevPage = np;
+    renderCumplDevPage();
+    document.getElementById('cumplDevPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+}
+
+// =====================================================================
+// PANEL TIPO DE PROPIEDAD
+// =====================================================================
+var ownerPage = 1;
+var ownerAllData = [];
+var ownerFiltered = [];
+
+var OWNER_LABELS = { company: 'Corporativo', personal: 'Personal (BYOD)', unknown: 'Desconocido' };
+var OWNER_COLORS = { company: 'var(--blue)', personal: 'var(--orange)', unknown: 'var(--muted)' };
+
+function showOwnerPanel(ownerType) {
+  var allDevices = [].concat(
+    DATA.windows || [], DATA.android || [], DATA.ios || [], DATA.macos || []
+  );
+  var filtered = allDevices.filter(function(d) {
+    var t = (d.managedDeviceOwnerType || '').toLowerCase();
+    if (ownerType === 'company')  return t === 'company';
+    if (ownerType === 'personal') return t === 'personal';
+    return t !== 'company' && t !== 'personal';
+  });
+
+  ownerAllData  = filtered;
+  ownerFiltered = filtered.slice();
+  ownerPage = 1;
+
+  var label = OWNER_LABELS[ownerType] || ownerType;
+  document.getElementById('ownerPanelTitle').textContent = 'Dispositivos - ' + label;
+  document.getElementById('ownerPanelCount').textContent = filtered.length + ' dispositivos';
+  document.getElementById('searchOwner').value = '';
+  renderOwnerPage();
+
+  var panel = document.getElementById('ownerPanel');
+  panel.style.display = 'block';
+  panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function filterOwnerDevices() {
+  var q = document.getElementById('searchOwner').value.toLowerCase();
+  ownerFiltered = ownerAllData.filter(function(d) {
+    return (d.deviceName        || '').toLowerCase().indexOf(q) >= 0 ||
+           (d.userPrincipalName || '').toLowerCase().indexOf(q) >= 0 ||
+           (d.operatingSystem   || '').toLowerCase().indexOf(q) >= 0;
+  });
+  ownerPage = 1;
+  document.getElementById('ownerPanelCount').textContent = ownerFiltered.length + ' dispositivos';
+  renderOwnerPage();
+}
+
+function renderOwnerPage() {
+  var tbody      = document.getElementById('ownerTableBody');
+  var totalPages = Math.ceil(ownerFiltered.length / PAGE_SIZE) || 1;
+  var start      = (ownerPage - 1) * PAGE_SIZE;
+  var pageData   = ownerFiltered.slice(start, start + PAGE_SIZE);
+
+  document.getElementById('ownerPageIndicator').textContent = 'Pagina ' + ownerPage + ' de ' + totalPages;
+  document.getElementById('ownerPrevPage').disabled    = (ownerPage === 1);
+  document.getElementById('ownerNextPage').disabled    = (ownerPage === totalPages);
+  document.getElementById('ownerPrevPage').style.opacity = (ownerPage === 1)          ? '0.4' : '1';
+  document.getElementById('ownerNextPage').style.opacity = (ownerPage === totalPages) ? '0.4' : '1';
+
+  if (pageData.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:var(--muted); padding:24px; font-family:var(--mono)">Sin dispositivos</td></tr>';
+    return;
+  }
+  tbody.innerHTML = pageData.map(function(d) {
+    return '<tr>' +
+      '<td><div class="device-name">' + (d.deviceName || '-') + '</div></td>' +
+      '<td><div class="device-user">' + (d.userPrincipalName || '-') + '</div></td>' +
+      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + (d.operatingSystem || '-') + '</td>' +
+      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + (d.osVersion || '-') + '</td>' +
+      '<td>' + badge(d.complianceState) + '</td>' +
+      '<td style="font-size:11px; color:var(--muted)">' + ([d.manufacturer, d.model].filter(Boolean).join(' / ') || '-') + '</td>' +
+      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + fmtDate(d.lastSyncDateTime) + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+function changeOwnerPage(step) {
+  var totalPages = Math.ceil(ownerFiltered.length / PAGE_SIZE) || 1;
+  var np = ownerPage + step;
+  if (np >= 1 && np <= totalPages) {
+    ownerPage = np;
+    renderOwnerPage();
+    document.getElementById('ownerPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+}
+
+// =====================================================================
+// REPORTE EJECUTIVO — SECCION CUMPLIMIENTO
+// =====================================================================
+function initReporteCumplimiento() {
+  var policies = DATA.compliancePolicies || [];
+  if (policies.length === 0) return;
+
+  var totalCompliant    = 0, totalNonCompliant = 0, totalError = 0, totalUnknown = 0;
+  policies.forEach(function(p) {
+    totalCompliant    += p.compliantCount    || 0;
+    totalNonCompliant += p.nonCompliantCount || 0;
+    totalError        += p.errorCount        || 0;
+    totalUnknown      += (p.unknownCount || 0) + (p.gracePeriodCount || 0);
+  });
+
+  var el = function(id) { return document.getElementById(id); };
+  if (el('rptCumplTotal'))       el('rptCumplTotal').textContent       = policies.length;
+  if (el('rptCumplCompliant'))   el('rptCumplCompliant').textContent   = totalCompliant;
+  if (el('rptCumplNonCompliant'))el('rptCumplNonCompliant').textContent= totalNonCompliant;
+  if (el('rptCumplError'))       el('rptCumplError').textContent       = totalError + totalUnknown;
+  if (el('rptCumplTag'))         el('rptCumplTag').textContent         = policies.length + ' directivas';
+
+  // Tabla por directiva
+  var tbody = el('rptCumplBody');
+  if (!tbody) return;
+  var rows = policies
+    .slice()
+    .sort(function(a, b) { return (b.nonCompliantCount||0) - (a.nonCompliantCount||0); })
+    .map(function(pol) {
+      var total  = (pol.compliantCount||0) + (pol.nonCompliantCount||0) + (pol.errorCount||0) + (pol.unknownCount||0) + (pol.gracePeriodCount||0);
+      var pctOk  = total > 0 ? Math.round((pol.compliantCount||0) / total * 100) : 0;
+      var col    = getPlatColor(pol.platform);
+      var barCol = pctOk >= 80 ? 'var(--green)' : pctOk >= 50 ? 'var(--orange)' : total > 0 ? 'var(--red)' : 'var(--muted)';
+      return '<tr style="cursor:pointer;" onclick="switchTab(\'cumplimiento\', document.querySelector(\'.tab:nth-child(3)\'))" title="Ver en pestaña Cumplimiento">' +
+        '<td style="font-weight:600; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + (pol.displayName || '-') + '</td>' +
+        '<td><span style="font-family:var(--mono); font-size:10px; color:' + col + '; background:rgba(255,255,255,0.05); padding:2px 7px; border-radius:4px;">' + (pol.platform || '-') + '</span></td>' +
+        '<td style="text-align:center; font-family:var(--mono); font-weight:700; color:var(--green);">'  + (pol.compliantCount    || 0) + '</td>' +
+        '<td style="text-align:center; font-family:var(--mono); font-weight:700; color:var(--red);">'    + (pol.nonCompliantCount || 0) + '</td>' +
+        '<td style="text-align:center; font-family:var(--mono); font-weight:700; color:var(--orange);">' + (pol.errorCount        || 0) + '</td>' +
+        '<td style="text-align:center; font-family:var(--mono); color:var(--muted);">'                   + ((pol.unknownCount||0) + (pol.gracePeriodCount||0)) + '</td>' +
+        '<td>' +
+          '<div style="display:flex; align-items:center; gap:8px;">' +
+            '<div style="flex:1; height:5px; background:rgba(255,255,255,0.06); border-radius:3px; overflow:hidden; min-width:60px;">' +
+              '<div style="height:100%; width:' + pctOk + '%; background:' + barCol + '; border-radius:3px; transition:width .4s;"></div>' +
+            '</div>' +
+            '<span style="font-family:var(--mono); font-size:11px; color:' + barCol + '; min-width:36px; text-align:right; font-weight:700;">' + (total > 0 ? pctOk + '%' : '-') + '</span>' +
+          '</div>' +
+        '</td>' +
+      '</tr>';
+    });
+  tbody.innerHTML = rows.join('') || '<tr><td colspan="7" style="text-align:center; color:var(--muted); padding:20px; font-family:var(--mono); font-size:12px;">Sin datos de directivas</td></tr>';
+}
+
 // ---- INIT ----
-try { renderRiskyUsers(); } catch(e) { console.warn('renderRiskyUsers:', e); }
-try { renderCA(); }         catch(e) { console.warn('renderCA:', e); }
-try { initEntraDonuts(); }  catch(e) { console.warn('initEntraDonuts:', e); }
-try { initObsolescencia(); } catch(e) { console.warn('initObsolescencia:', e); }
+try { renderRiskyUsers(); }           catch(e) { console.warn('renderRiskyUsers:', e); }
+try { renderCA(); }                   catch(e) { console.warn('renderCA:', e); }
+try { initEntraDonuts(); }            catch(e) { console.warn('initEntraDonuts:', e); }
+try { initEntraCards(); }             catch(e) { console.warn('initEntraCards:', e); }
+try { initObsolescencia(); }          catch(e) { console.warn('initObsolescencia:', e); }
+try { initDuplicates(); }             catch(e) { console.warn('initDuplicates:', e); }
+try { initIntuneStale(); }            catch(e) { console.warn('initIntuneStale:', e); }
+try { initEntraDuplicates(); }        catch(e) { console.warn('initEntraDuplicates:', e); }
+try { initCumplimiento(); }           catch(e) { console.warn('initCumplimiento:', e); }
+try { initReporteCumplimiento(); }    catch(e) { console.warn('initReporteCumplimiento:', e); }
 </script>
 </body>
 </html>
@@ -1801,14 +3461,35 @@ $html = $html.Replace('$cntNoCompliant', $cntNoCompliant)
 # MFA
 $pctMFAVal = [string]$pctMFA
 $html = $html.Replace('$pctMFAVal', $pctMFAVal)
+# Ownership / Tipo de Propiedad
+$html = $html.Replace('$cntCorporate',    [string]$cntCorporate)
+$html = $html.Replace('$cntPersonal',     [string]$cntPersonal)
+$html = $html.Replace('$cntOwnerUnknown', [string]$cntOwnerUnknown)
+$html = $html.Replace('$pctCorporate',    [string]$pctCorporate)
+$html = $html.Replace('$pctPersonal',     [string]$pctPersonal)
+$html = $html.Replace('$pctOwnerUnknown', [string]$pctOwnerUnknown)
+$html = $html.Replace('$dashCorporate',   $dashCorporate)
+$html = $html.Replace('$dashPersonal',    $dashPersonal)
+$html = $html.Replace('$dashOwnerUnknown',$dashOwnerUnknown)
+$html = $html.Replace('$rotPersonal',     $rotPersonal)
+$html = $html.Replace('$rotOwnerUnknown', $rotOwnerUnknown)
 # JSON datos
 $html = $html.Replace('$jsonWin',     $jsonWin)
 $html = $html.Replace('$jsonAndroid', $jsonAndroid)
 $html = $html.Replace('$jsoniOS',     $jsoniOS)
 $html = $html.Replace('$jsonMac',     $jsonMac)
-$html = $html.Replace('$jsonEntra',   $jsonEntra)
-$html = $html.Replace('$jsonRisky',   $jsonRisky)
-$html = $html.Replace('$jsonCA',      $jsonCA)
+$html = $html.Replace('$jsonEntra',      $jsonEntra)
+$html = $html.Replace('$jsonRisky',      $jsonRisky)
+$html = $html.Replace('$jsonCA',         $jsonCA)
+$html = $html.Replace('$jsonIntuneIds',   $jsonIntuneIds)
+$html = $html.Replace('$jsonIntuneNames', $jsonIntuneNames)
+# Sanitizar JSON de compliance: escapar </script> para evitar ruptura del bloque JS
+$jsonCompliancePoliciesSafe = $jsonCompliancePolicies -replace '</script>', '<\/script>'
+$html = $html.Replace('$jsonCompliancePolicies', $jsonCompliancePoliciesSafe)
+$html = $html.Replace('$autorInforme',    $autorInforme)
+$html = $html.Replace('$anioCreacion',    $anioCreacion)
+# Builds Windows dinamicos
+$html = $html.Replace('$WIN_LATEST_PLACEHOLDER$', $winLatestJs)
 
 # ==============================
 # GUARDAR Y ABRIR
