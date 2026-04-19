@@ -51,10 +51,10 @@ Administrar el ecosistema de Microsoft mediante peticiones manuales o scripts di
 Actualmente estamos trabajando en las siguientes funcionalidades para ampliar la "navaja suiza":
 
 - [x] **Limpieza de dispositivos duplicados en Intune:** Análisis de dispositivos inscritos en intune para identificar los duplicados y poderlos higienizar.
+- [X] **Engine de Reporting HTML**: Motor de generación de informes interactivos (filtros, búsqueda y gráficas) para el análisis de cumplimiento de dispositivos en el ecosistema M365.
 - [ ] **Sincronización de GAL a Contactos:** Automatización para exportar e hidratar la Global Address List (GAL) directamente en los contactos de Outlook de los usuarios.
 - [ ] **Etiquetado Dinámico de Dispositivos:** Asignación automática de etiquetas (tags) en Intune/Entra ID basada en atributos específicos (ExtensionAttributes del usuario propietario, departamento, etc).
 - [ ] **Módulo de Auditoría de Licencias:** Reportes detallados de uso y optimización de costes en Office 365.
-- [ ] **Automatización de exportación CSV para Assessment de Intune:** Generación de informes detallados y estructurados para realizar auditorías de cumplimiento y estado de la configuración de Intune.
-- [ ] **Engine de Reporting HTML**: Motor de generación de informes interactivos (filtros, búsqueda y gráficas) para el análisis de cumplimiento de dispositivos en el ecosistema M365.
+
 
 ---
