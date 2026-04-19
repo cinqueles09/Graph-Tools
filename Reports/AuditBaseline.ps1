@@ -84,7 +84,6 @@ This script is provided "as is" without warranty of any kind.
 Use at your own risk.
 
 #>
-
 # ==============================================================================
 # DASHBOARD PROFESIONAL â€” INTUNE + ENTRA ID ASSESSMENT
 # ==============================================================================
@@ -195,182 +194,84 @@ $intuneDevices = Get-GraphPagedData -Uri $intuneUri -Headers $headers -Label "Di
 $entraUri = "https://graph.microsoft.com/v1.0/devices?`$select=displayName,operatingSystem,operatingSystemVersion,isCompliant,isManaged,trustType,approximateLastSignInDateTime,mdmAppId,managementType,registrationDateTime,deviceId"
 $entraDevices = Get-GraphPagedData -Uri $entraUri -Headers $headers -Label "Dispositivos Entra ID"
 
-# Risky Users
 $riskyUsers = @()
-try {
-    $riskyUri = "https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?`$filter=riskLevel ne 'none'"
-    $riskyUsers = (Invoke-RestMethod -Uri $riskyUri -Headers $headers -Method Get).value
-    Write-Host "  -> Riesgos: $($riskyUsers.Count) detectados" -ForegroundColor Gray
-} catch {
-    Write-Host "  ! Riesgos: Sin acceso o sin licencia P2" -ForegroundColor DarkYellow
-}
-
-# Conditional Access Policies
 $conditionalPolicies = @()
-try {
-    $caUri = "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies?`$select=displayName,state,createdDateTime,modifiedDateTime"
-    $conditionalPolicies = Get-GraphPagedData -Uri $caUri -Headers $headers -Label "Politicas de Acceso Condicional"
-} catch {
-    Write-Host "  ! Acceso Condicional: Sin acceso suficiente para leer politicas" -ForegroundColor DarkYellow
-}
-
-# Compliance Policies (directivas de cumplimiento)
 $compliancePolicies = @()
-try {
-    $cpUri = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies?`$select=id,displayName,lastModifiedDateTime"
-    $compliancePolicies = Get-GraphPagedData -Uri $cpUri -Headers $headers -Label "Directivas de cumplimiento"
-} catch {
-    Write-Host "  ! Compliance Policies: Sin acceso (requiere DeviceManagementConfiguration.Read)" -ForegroundColor DarkYellow
-}
-
-# Por cada politica: overview de estados + lista de dispositivos no conformes con settings
 $compliancePolicyData = @()
-foreach ($pol in $compliancePolicies) {
-    $polId = $pol.id
-    $polName = $pol.displayName
-    $odataType = $pol.'@odata.type' -replace '#microsoft.graph.',''
-
-    # Plataforma inferida del tipo OData (1er intento)
-    $platform = switch -Wildcard ($odataType) {
-        'windows10CompliancePolicy'         { 'Windows' }
-        'windows10MobileCompliancePolicy'   { 'Windows Mobile' }
-        'windows81CompliancePolicy'         { 'Windows 8.1' }
-        'androidCompliancePolicy'           { 'Android' }
-        'androidWorkProfileCompliancePolicy'{ 'Android Enterprise' }
-        'androidDeviceOwnerCompliancePolicy'{ 'Android Enterprise' }
-        'iosCompliancePolicy'               { 'iOS' }
-        'macOSCompliancePolicy'             { 'macOS' }
-        default                             { '' }
-    }
-
-    # 2do intento: inferir plataforma desde el displayName si @odata.type estaba ausente
-    if ([string]::IsNullOrWhiteSpace($platform)) {
-        $dn = $polName.ToLower()
-        $platform = if     ($dn -match 'windows|w10|w11|win')       { 'Windows' }
-                    elseif ($dn -match 'android|byod|cope|work.prof') { 'Android Enterprise' }
-                    elseif ($dn -match 'ios|iphone|ipad')            { 'iOS' }
-                    elseif ($dn -match 'mac|macos|apple')            { 'macOS' }
-                    else                                             { 'Otro' }
-    }
-
-    # Overview (totales conformes/no conformes/error/etc.)
-    $overview = $null
-    try {
-        $ovUri = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$polId/deviceStatusOverview"
-        $overview = Invoke-RestMethod -Uri $ovUri -Headers $headers -Method Get -ErrorAction Stop
-    } catch {}
-
-    # Si el overview devuelve todo a 0, usar deviceStatuses SIN $filter ni $select (evita 500)
-    $ovTotal = 0
-    if ($null -ne $overview) {
-        $ovTotal = [int]($overview.compliantDeviceCount) + [int]($overview.nonCompliantDeviceCount) +
-                   [int]($overview.errorDeviceCount)     + [int]($overview.unknownDeviceCount)      +
-                   [int]($overview.inGracePeriodCount)   + [int]($overview.configManagerCount)
-    }
-    $allStatuses = @()
-    if ($ovTotal -eq 0) {
-        try {
-            # Sin $filter ni $select — algunos tenants devuelven 500 con cualquier query param
-            $allStatusUri = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$polId/deviceStatuses"
-            $allStatuses  = Get-GraphPagedData -Uri $allStatusUri -Headers $headers -Label "  -> Estados fallback: $polName"
-            if ($allStatuses.Count -gt 0) {
-                $overview = [PSCustomObject]@{
-                    compliantDeviceCount    = @($allStatuses | Where-Object { $_.status -eq 'compliant'     }).Count
-                    nonCompliantDeviceCount = @($allStatuses | Where-Object { $_.status -eq 'noncompliant'  }).Count
-                    errorDeviceCount        = @($allStatuses | Where-Object { $_.status -eq 'error'         }).Count
-                    unknownDeviceCount      = @($allStatuses | Where-Object { $_.status -eq 'unknown'       }).Count
-                    inGracePeriodCount      = @($allStatuses | Where-Object { $_.status -eq 'inGracePeriod' }).Count
-                    configManagerCount      = 0
-                }
-            }
-        } catch {
-            Write-Host "    ! deviceStatuses no disponible para: $polName" -ForegroundColor DarkYellow
-        }
-    }
-
-    # Dispositivos no conformes: filtrar localmente desde $allStatuses si ya los tenemos,
-    # o hacer llamada separada sin $filter (evita 500 en tenants con restricciones)
-    $nonCompliantDevices = @()
-    try {
-        if ($allStatuses.Count -gt 0) {
-            # Reutilizar los datos ya descargados, filtrar en PS
-            $nonCompliantDevices = @($allStatuses | Where-Object {
-                $_.status -ne 'compliant' -and $_.status -ne 'notApplicable'
-            })
-        } else {
-            # Descarga fresca sin $filter — luego filtramos aquí
-            $dsUri = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$polId/deviceStatuses"
-            $allDs = Get-GraphPagedData -Uri $dsUri -Headers $headers -Label "  -> No conformes: $polName"
-            $nonCompliantDevices = @($allDs | Where-Object {
-                $_.status -ne 'compliant' -and $_.status -ne 'notApplicable'
-            })
-        }
-    } catch {
-        Write-Host "    ! No conformes no disponible para: $polName" -ForegroundColor DarkYellow
-    }
-
-    # Settings no conformes vía deviceSettingStateSummaries
-    $settingSummaries = @()
-    try {
-        $ssUri = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$polId/deviceSettingStateSummaries"
-        $settingSummaries = Get-GraphPagedData -Uri $ssUri -Headers $headers -Label "  -> Settings: $polName"
-    } catch {}
-
-    # Calcular totales desde settingStateSummaries (fuente más fiable — siempre funciona)
-    # Nota: estos son contadores por SETTING, no por dispositivo, pero son el mejor dato disponible
-    $settingsCompliant    = [int](($settingSummaries | Measure-Object -Property compliantDeviceCount    -Sum).Sum)
-    $settingsNonCompliant = [int](($settingSummaries | Measure-Object -Property nonCompliantDeviceCount -Sum).Sum)
-    $settingsError        = [int](($settingSummaries | Measure-Object -Property errorDeviceCount        -Sum).Sum)
-
-    # Fuente de contadores (prioridad: overview > deviceStatuses > settingSummaries)
-    $hasOverview = ($null -ne $overview) -and (([int]($overview.compliantDeviceCount) + [int]($overview.nonCompliantDeviceCount)) -gt 0)
-
-    $finalCompliant    = if ($hasOverview) { [int]($overview.compliantDeviceCount)    }
-                         elseif ($settingsCompliant    -gt 0) { $settingsCompliant    } else { 0 }
-    $finalNonCompliant = if ($hasOverview) { [int]($overview.nonCompliantDeviceCount) }
-                         elseif ($settingsNonCompliant -gt 0) { $settingsNonCompliant } else { 0 }
-    $finalError        = if ($hasOverview) { [int]($overview.errorDeviceCount)        }
-                         elseif ($settingsError        -gt 0) { $settingsError        } else { 0 }
-    $finalUnknown      = if ($hasOverview) { [int]($overview.unknownDeviceCount)     } else { 0 }
-    $finalGrace        = if ($hasOverview) { [int]($overview.inGracePeriodCount)     } else { 0 }
-    $finalConfig       = if ($hasOverview) { [int]($overview.configManagerCount)     } else { 0 }
-
-    $dataSource = if ($hasOverview) { 'overview' } elseif ($settingsCompliant + $settingsNonCompliant -gt 0) { 'settings' } else { 'none' }
-    Write-Host ("    [{0}] C:{1} NC:{2} Err:{3}  (fuente: {4})" -f $polName, $finalCompliant, $finalNonCompliant, $finalError, $dataSource) -ForegroundColor DarkGray
-
-    $compliancePolicyData += [PSCustomObject]@{
-        id                 = $polId
-        displayName        = $polName
-        platform           = $platform
-        odataType          = $odataType
-        lastModified       = NullSafe $pol.lastModifiedDateTime
-        compliantCount     = $finalCompliant
-        nonCompliantCount  = $finalNonCompliant
-        errorCount         = $finalError
-        unknownCount       = $finalUnknown
-        gracePeriodCount   = $finalGrace
-        configManagerCount = $finalConfig
-        nonCompliantDevices= $nonCompliantDevices
-        settingSummaries   = $settingSummaries
-    }
-}
-Write-Host "  -> Compliance: $($compliancePolicies.Count) politicas procesadas" -ForegroundColor Gray
-
-# MFA Registration (requiere Reports.Read.All)
 $mfaRegistered = 0
 $mfaTotal      = 0
+$pctMFA = 0
+
+# ==============================
+# 4b. DIRECTIVA POR DEFECTO
+# ==============================
+$defaultPolicyId              = ""
+$defaultPolicyNonCompl        = 0   # Has a compliance policy assigned  -> nonCompliant
+$defaultPolicyError           = 0   # Is active                         -> nonCompliant
+$defaultPolicyUnknown         = 0   # Enrolled user exists              -> nonCompliant
+
 try {
-    $mfaData = Get-GraphPagedData -Uri "https://graph.microsoft.com/v1.0/reports/credentialUserRegistrationDetails" -Headers $headers -Label "Registro MFA usuarios"
-    $mfaTotal      = @($mfaData).Count
-    $mfaRegistered = @($mfaData | Where-Object { $_.isMfaRegistered -eq $true }).Count
-    Write-Host "  -> MFA: $mfaRegistered de $mfaTotal usuarios registrados" -ForegroundColor Gray
+    # Coger un dispositivo al azar de Intune para consultar sus estados de directiva
+    $sampleDevice = $intuneDevices | Where-Object { $_.id } | Select-Object -First 1
+    if ($sampleDevice) {
+        $sampleId = $sampleDevice.id
+        Write-Host "  -> Buscando Default Device Compliance Policy via dispositivo: $($sampleDevice.deviceName)" -ForegroundColor Gray
+        $policyStates = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$sampleId/deviceCompliancePolicyStates" -Headers $headers -Method Get -ErrorAction Stop
+        $defaultState = $policyStates.value | Where-Object { $_.displayName -match "Default Device Compliance Policy" } | Select-Object -First 1
+        if ($defaultState) {
+            $defaultPolicyId = $defaultState.id
+            Write-Host "  -> Default Policy ID encontrado: $defaultPolicyId" -ForegroundColor Gray
+
+            # Leer setting summaries — Graph devuelve settingName con ruta completa,
+            # p.ej. "deviceCompliancePolicy/HasCompliancePolicyAssigned"
+            $defSettings = @()
+            try {
+                $defSettingsUri = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$defaultPolicyId/deviceSettingStateSummaries"
+                $defSettingsResp = Invoke-RestMethod -Uri $defSettingsUri -Headers $headers -Method Get -ErrorAction Stop
+                $defSettings = @($defSettingsResp.value)
+
+                # Volcar todos los settingNames para diagnóstico
+                Write-Host "  -> Default Policy settings encontrados ($($defSettings.Count)):" -ForegroundColor DarkGray
+                foreach ($s in $defSettings) {
+                    Write-Host ("     [{0}]  NC:{1}  Err:{2}  Unk:{3}" -f `
+                        $s.settingName, $s.nonCompliantDeviceCount, $s.errorDeviceCount, $s.unknownDeviceCount) -ForegroundColor DarkGray
+                }
+            } catch {
+                Write-Host "  ! No se pudieron leer deviceSettingStateSummaries: $($_.Exception.Message)" -ForegroundColor DarkYellow
+            }
+
+            # Matching por la parte final del settingName (tras "/" o desde el inicio),
+            # case-insensitive — cubre tanto "HasCompliancePolicyAssigned" como
+            # "deviceCompliancePolicy/HasCompliancePolicyAssigned"
+            function Get-DefaultSettingNC {
+                param($Settings, [string]$Keyword)
+                $match = $Settings | Where-Object {
+                    ($_.settingName -split '/')[-1] -match "(?i)$Keyword"
+                } | Select-Object -First 1
+                if ($match) { return [int]($match.nonCompliantDeviceCount) }
+                return 0
+            }
+
+            $defaultPolicyNonCompl = Get-DefaultSettingNC -Settings $defSettings -Keyword "RequireDeviceCompliancePolicyAssigned"
+            $defaultPolicyError    = Get-DefaultSettingNC -Settings $defSettings -Keyword "RequireRemainContact"
+            $defaultPolicyUnknown  = Get-DefaultSettingNC -Settings $defSettings -Keyword "RequireUserExistence"
+
+            Write-Host ("  -> Default Policy valores: HasPolicy:{0}  IsActive:{1}  EnrolledUser:{2}" -f `
+                $defaultPolicyNonCompl, $defaultPolicyError, $defaultPolicyUnknown) -ForegroundColor Cyan
+
+        } else {
+            Write-Host "  ! Default Device Compliance Policy no encontrada entre los estados del dispositivo de muestra" -ForegroundColor DarkYellow
+            Write-Host "  -> Directivas encontradas en el dispositivo:" -ForegroundColor DarkGray
+            foreach ($ps in $policyStates.value) {
+                Write-Host "     $($ps.displayName)  [$($ps.id)]" -ForegroundColor DarkGray
+            }
+        }
+    }
 } catch {
-    Write-Host "  ! MFA: Sin acceso (requiere Reports.Read.All)" -ForegroundColor DarkYellow
+    Write-Host "  ! No se pudo obtener la Default Device Compliance Policy: $($_.Exception.Message)" -ForegroundColor DarkYellow
 }
-$pctMFA = if ($mfaTotal -gt 0) { [math]::Round(($mfaRegistered / $mfaTotal) * 100) } else { 0 }
-# ==============================
-# 5. CALCULO DE KPIs - INTUNE
-# ==============================
+
+
 Write-Host ""
 Write-Host "  Calculando KPIs..." -ForegroundColor Yellow
 
@@ -430,9 +331,9 @@ $pctOwnerUnknown = if ($cntTotal -gt 0) { [math]::Round(($cntOwnerUnknown / $cnt
 $cntEntra   = @($entraDevices).Count
 $cntHAADJ   = @($entraDevices | Where-Object { $_.trustType -eq "ServerAd" }).Count
 $cntEntraAD = @($entraDevices | Where-Object { $_.trustType -eq "AzureAd" }).Count
-$cntRiskyU  = @($riskyUsers).Count
-$cntCAPol   = @($conditionalPolicies).Count
-$cntCAPol_En= @($conditionalPolicies | Where-Object { $_.state -eq "enabled" }).Count
+$cntRiskyU  = 0
+$cntCAPol   = 0
+$cntCAPol_En= 0
 
 # ==============================
 # 6. SERIALIZACION JSON (SEGURA)
@@ -518,67 +419,35 @@ function ConvertTo-SafeJsonCA {
     return (ConvertTo-Json -InputObject @($arr) -Depth 3 -Compress)
 }
 
+function Test-ComplianceDeviceMatchesPlatform {
+    param(
+        [string]$PolicyPlatform,
+        $Device
+    )
+
+    $policyPlatform = [string]$PolicyPlatform
+    $devicePlatform = [string]$Device.platform
+
+    if ([string]::IsNullOrWhiteSpace($policyPlatform)) { return $true }
+    if ([string]::IsNullOrWhiteSpace($devicePlatform)) { return $false }
+
+    switch -Regex ($policyPlatform.ToLower()) {
+        'windows' { return $devicePlatform -match '(?i)windows' }
+        'android' { return $devicePlatform -match '(?i)android' }
+        '^ios$'   { return $devicePlatform -match '(?i)^ios$|iphone|ipad' }
+        'mac'     { return $devicePlatform -match '(?i)mac' }
+        default   { return $devicePlatform -match [regex]::Escape($policyPlatform) }
+    }
+}
+
 $jsonWin     = ConvertTo-SafeJson -Data $winDevices
 $jsonAndroid = ConvertTo-SafeJson -Data $androidDevices
 $jsoniOS     = ConvertTo-SafeJson -Data $iosDevices
 $jsonMac     = ConvertTo-SafeJson -Data $macDevices
 $jsonEntra   = ConvertTo-SafeJsonEntra  -Data $entraDevices
-$jsonRisky   = ConvertTo-SafeJsonRisky  -Data $riskyUsers
-$jsonCA      = ConvertTo-SafeJsonCA     -Data $conditionalPolicies
-
-# Serializar compliance policies con settings y dispositivos
-$jsonCompliancePolicies = if ($compliancePolicyData.Count -eq 0) { "[]" } else {
-    $arr = @()
-    foreach ($pol in $compliancePolicyData) {
-        $settings = @()
-        foreach ($s in $pol.settingSummaries) {
-            $settings += [PSCustomObject]@{
-                settingName         = NullSafe $s.settingName
-                unknownDeviceCount  = if ($null -ne $s.unknownDeviceCount)     { [int]$s.unknownDeviceCount }     else { 0 }
-                notApplicableCount  = if ($null -ne $s.notApplicableDeviceCount){ [int]$s.notApplicableDeviceCount } else { 0 }
-                compliantCount      = if ($null -ne $s.compliantDeviceCount)    { [int]$s.compliantDeviceCount }    else { 0 }
-                remediatedCount     = if ($null -ne $s.remediatedDeviceCount)   { [int]$s.remediatedDeviceCount }   else { 0 }
-                nonCompliantCount   = if ($null -ne $s.nonCompliantDeviceCount) { [int]$s.nonCompliantDeviceCount } else { 0 }
-                errorCount          = if ($null -ne $s.errorDeviceCount)        { [int]$s.errorDeviceCount }        else { 0 }
-                conflictCount       = if ($null -ne $s.conflictDeviceCount)     { [int]$s.conflictDeviceCount }     else { 0 }
-            }
-        }
-        $devs = @()
-        foreach ($d in $pol.nonCompliantDevices) {
-            $devs += [PSCustomObject]@{
-                deviceName   = NullSafe $d.deviceDisplayName
-                upn          = NullSafe $d.userPrincipalName
-                status       = NullSafe $d.status
-                lastReported = NullSafe $d.lastReportedDateTime
-            }
-        }
-        $arr += [PSCustomObject]@{
-            id                = $pol.id
-            displayName       = $pol.displayName
-            platform          = $pol.platform
-            lastModified      = $pol.lastModified
-            compliantCount    = $pol.compliantCount
-            nonCompliantCount = $pol.nonCompliantCount
-            errorCount        = $pol.errorCount
-            unknownCount      = $pol.unknownCount
-            gracePeriodCount  = $pol.gracePeriodCount
-            settings          = $settings
-            devices           = $devs
-        }
-    }
-    ConvertTo-Json -InputObject @($arr) -Depth 10 -Compress
-}
-
-# Diagnostico de cumplimiento en consola
-Write-Host ""
-Write-Host "  Diagnostico Cumplimiento:" -ForegroundColor Yellow
-foreach ($pol in $compliancePolicyData) {
-    Write-Host ("    [{0}] Conformes:{1}  NoConformes:{2}  Error:{3}  Dispositivos:{4}" -f `
-        $pol.displayName, $pol.compliantCount, $pol.nonCompliantCount, $pol.errorCount, $pol.nonCompliantDevices.Count) -ForegroundColor Gray
-}
-if ($compliancePolicyData.Count -eq 0) {
-    Write-Host "    Sin directivas de cumplimiento serializadas." -ForegroundColor DarkYellow
-}
+$jsonRisky   = "[]"
+$jsonCA      = "[]"
+$jsonCompliancePolicies = "[]"
 
 # IDs y nombres de dispositivos Intune para cruce con Entra (filtro huerfanos)
 $allIntune = [System.Collections.Generic.List[PSObject]]::new()
@@ -727,6 +596,12 @@ foreach ($branch in $winBranchMeta) {
     $src    = $winBuildSource[$p]
     $winLatestJs += "  '$p': { build: '$build', label: '$label', eol: $eolJs, url: '$url', source: '$src' },`n"
 }
+$winLatestJs += "};`nvar WIN_MONTH_BASELINE = {`n"
+foreach ($branch in $winBranchMeta) {
+    $p = $branch.prefix
+    $baseline = $winFallback[$p]
+    $winLatestJs += "  '$p': '$baseline',`n"
+}
 $winLatestJs += "};`n// $buildOrigin"
 
 # ==============================
@@ -793,7 +668,7 @@ $html = @'
   --green: #68d391; --orange: #f6ad55; --red: #fc8181;
   --font: 'Syne', sans-serif; --mono: 'IBM Plex Mono', monospace;
 }
-body { font-family: var(--font); background: var(--bg); color: var(--text); font-size: 14px; }
+body { font-family: var(--font); background: var(--bg); color: var(--text); font-size: 14px; padding-bottom: 64px; }
 .header { background: #0d1b35; border-bottom: 1px solid var(--border); padding: 0 32px;
   display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 24px;
   min-height: 72px; position: relative; }
@@ -920,7 +795,8 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
 .report-kpi-val { font-size:28px; font-weight:700; }
 .report-kpi-lbl { font-family:var(--mono); font-size:9px; color:var(--muted); text-transform:uppercase; letter-spacing:1px; margin-top:4px; }
 .footer { background:var(--surface); border-top:1px solid var(--border); padding:14px 32px;
-  display:flex; justify-content:space-between; align-items:center; }
+  display:flex; justify-content:space-between; align-items:center;
+  position:fixed; bottom:0; left:0; right:0; z-index:100; }
 .footer-text { font-family:var(--mono); font-size:10px; color:var(--muted); }
 .footer-link { font-family:var(--mono); font-size:10px; color:var(--blue); cursor:pointer; margin-left:16px; }
 /* DONUTS ENTRA */
@@ -987,8 +863,8 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
 <nav class="tabs-bar">
   <div class="tab active" onclick="switchTab('intune', this)">Intune <span class="tab-badge">$cntTotal</span></div>
   <div class="tab" onclick="switchTab('entra', this)">Entra ID <span class="tab-badge">$cntEntraNum</span></div>
-  <div class="tab" onclick="switchTab('cumplimiento', this)">Cumplimiento <span class="tab-badge" id="tabBadgeCumpl">-</span></div>
   <div class="tab" onclick="switchTab('reporte', this)">Reporte Ejecutivo</div>
+  <div class="tab" onclick="switchTab('leyendas', this)">Leyendas</div>
 </nav>
 
 <!-- TAB INTUNE -->
@@ -1099,7 +975,7 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
                 <div><span class="legend-count">$cntCorporate</span><span class="legend-pct">$pctCorporate%</span></div>
               </div>
               <div class="legend-row" style="cursor:pointer;" onclick="showOwnerPanel('personal')" onmouseover="this.style.background='rgba(246,173,85,0.04)'" onmouseout="this.style.background=''">
-                <div class="legend-left"><span class="legend-dot" style="background:#f6ad55"></span>Personal</div>
+                <div class="legend-left"><span class="legend-dot" style="background:#f6ad55"></span>Personal (BYOD)</div>
                 <div><span class="legend-count">$cntPersonal</span><span class="legend-pct">$pctPersonal%</span></div>
               </div>
               <div class="legend-row" style="cursor:pointer;" onclick="showOwnerPanel('unknown')" onmouseover="this.style.background='rgba(100,116,139,0.04)'" onmouseout="this.style.background=''">
@@ -1193,7 +1069,7 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
       <div class="obs-card">
         <div class="obs-card-header">
           <span style="font-size:12px; font-weight:600;">Tipo de Gestion</span>
-          <span class="panel-tag">Defender &middot; Intune &middot; Android Ent.</span>
+          <span class="panel-tag">Haz clic en cada leyenda</span>
         </div>
         <div style="padding:14px 18px; display:flex; flex-direction:column; gap:10px;" id="obsByMgmt"></div>
       </div>
@@ -1544,58 +1420,6 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
   </div>
 </div>
 
-<!-- TAB CUMPLIMIENTO -->
-<div class="tab-content" id="tab-cumplimiento">
-  <div class="main">
-
-    <!-- KPIs globales -->
-    <div class="section-label">Resumen de Cumplimiento por Plataforma</div>
-    <div id="cumplKpiGrid" style="display:grid; grid-template-columns:repeat(5,1fr); gap:14px; margin-bottom:28px;"></div>
-
-    <!-- Filtros de plataforma -->
-    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:20px; align-items:center;">
-      <span style="font-family:var(--mono); font-size:10px; color:var(--muted); letter-spacing:1px; text-transform:uppercase;">Plataforma:</span>
-      <button class="ver-plat-btn active" id="cumplBtnAll"     onclick="setCumplFilter('all',this)">Todas</button>
-      <button class="ver-plat-btn"        id="cumplBtnWin"     onclick="setCumplFilter('Windows',this)">Windows</button>
-      <button class="ver-plat-btn"        id="cumplBtnAndroid" onclick="setCumplFilter('Android',this)">Android</button>
-      <button class="ver-plat-btn"        id="cumplBtnIos"     onclick="setCumplFilter('iOS',this)">iOS</button>
-      <button class="ver-plat-btn"        id="cumplBtnMac"     onclick="setCumplFilter('macOS',this)">macOS</button>
-    </div>
-
-    <!-- Lista de directivas -->
-    <div id="cumplPoliciesList"></div>
-
-    <!-- Panel detalle: dispositivos no conformes de una directiva -->
-    <div class="panel" id="cumplDevPanel" style="display:none; margin-top:20px;">
-      <div class="panel-header">
-        <span class="panel-title" id="cumplDevTitle">Dispositivos no conformes</span>
-        <div style="display:flex; gap:8px; align-items:center;">
-          <span class="panel-tag" id="cumplDevCount">-</span>
-          <button class="close-btn" onclick="document.getElementById('cumplDevPanel').style.display='none'">Cerrar X</button>
-        </div>
-      </div>
-      <div class="panel-body">
-        <div class="search-wrap">
-          <span class="search-icon">&#x1F50D;</span>
-          <input class="search-input" id="searchCumplDev" placeholder="Buscar por nombre o usuario..." oninput="filterCumplDevices()">
-        </div>
-        <table class="device-table">
-          <thead><tr>
-            <th>Dispositivo</th><th>Usuario</th><th>Estado</th><th>Ultimo Reporte</th>
-          </tr></thead>
-          <tbody id="cumplDevBody"></tbody>
-        </table>
-        <div style="display:flex; justify-content:center; align-items:center; gap:15px; margin-top:15px; padding-top:15px; border-top:1px solid var(--border);">
-          <button class="export-btn" id="cumplDevPrev" onclick="changeCumplDevPage(-1)" style="padding:5px 12px;">&laquo; Anterior</button>
-          <span id="cumplDevPageInd" style="font-family:var(--mono); font-size:12px; color:var(--muted);">Pagina 1 de 1</span>
-          <button class="export-btn" id="cumplDevNext" onclick="changeCumplDevPage(1)" style="padding:5px 12px;">Siguiente &raquo;</button>
-        </div>
-      </div>
-    </div>
-
-  </div>
-</div>
-
 <!-- TAB REPORTE -->
 <div class="tab-content" id="tab-reporte">
   <div class="main">
@@ -1641,48 +1465,22 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
         <div class="report-kpi-lbl">&#x1F527; Correccion Identidad</div>
       </div>
     </div>
-    <div class="section-label" style="margin-top:8px;">Cumplimiento de Directivas</div>
-    <div class="report-kpi-row" style="grid-template-columns:repeat(4,1fr);" id="rptCumplRow">
-      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('cumplimiento', document.querySelector('.tab:nth-child(3)'));">
-        <div class="report-kpi-val" style="color:var(--blue)" id="rptCumplTotal">-</div>
-        <div class="report-kpi-lbl">Directivas Activas</div>
+    <div class="section-label" style="margin-top:8px;">Directiva por Defecto <span style="font-family:var(--mono); font-size:9px; color:var(--muted); letter-spacing:0; text-transform:none; font-weight:400;">Default Device Compliance Policy &bull; <span style="opacity:0.6;">$defaultPolicyId</span></span></div>
+    <div class="report-kpi-row" style="grid-template-columns:repeat(3,1fr);" id="rptDefaultPolicyRow">
+      <div class="report-kpi">
+        <div class="report-kpi-val" style="color:var(--red)">$defaultPolicyNonCompl</div>
+        <div class="report-kpi-lbl">&#x2715; Has a compliance policy assigned</div>
       </div>
-      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('cumplimiento', document.querySelector('.tab:nth-child(3)'));">
-        <div class="report-kpi-val" style="color:var(--green)" id="rptCumplCompliant">-</div>
-        <div class="report-kpi-lbl">Dispositivos Conformes</div>
+      <div class="report-kpi">
+        <div class="report-kpi-val" style="color:var(--orange)">$defaultPolicyError</div>
+        <div class="report-kpi-lbl">&#x1F4F6; Is active (remain contact)</div>
       </div>
-      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('cumplimiento', document.querySelector('.tab:nth-child(3)'));">
-        <div class="report-kpi-val" style="color:var(--red)" id="rptCumplNonCompliant">-</div>
-        <div class="report-kpi-lbl">No Conformes</div>
-      </div>
-      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('cumplimiento', document.querySelector('.tab:nth-child(3)'));">
-        <div class="report-kpi-val" style="color:var(--orange)" id="rptCumplError">-</div>
-        <div class="report-kpi-lbl">Con Error / Desconocido</div>
+      <div class="report-kpi">
+        <div class="report-kpi-val" style="color:var(--muted)">$defaultPolicyUnknown</div>
+        <div class="report-kpi-lbl">&#x1F464; Enrolled user exists</div>
       </div>
     </div>
-    <!-- Tabla resumen de directivas en el reporte -->
-    <div class="panel" style="margin-bottom:24px;">
-      <div class="panel-header">
-        <span class="panel-title">Resumen por Directiva</span>
-        <span class="panel-tag" id="rptCumplTag">-</span>
-      </div>
-      <div class="panel-body" style="padding:0;">
-        <table class="device-table" id="rptCumplTable">
-          <thead><tr>
-            <th>Directiva</th>
-            <th>Plataforma</th>
-            <th style="text-align:center">Conformes</th>
-            <th style="text-align:center">No Conformes</th>
-            <th style="text-align:center">Error</th>
-            <th style="text-align:center">Desconocido</th>
-            <th style="min-width:120px">Cumplimiento</th>
-          </tr></thead>
-          <tbody id="rptCumplBody">
-            <tr><td colspan="7" style="text-align:center; color:var(--muted); padding:20px; font-family:var(--mono); font-size:12px;">Cargando...</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
+    
     <div class="panel">
       <div class="panel-header">
         <span class="panel-title">Exportar Assessment</span>
@@ -1697,11 +1495,94 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
   </div>
 </div>
 
+<!-- TAB LEYENDAS -->
+<div class="tab-content" id="tab-leyendas">
+  <div class="main">
+    <div class="section-label">Leyendas del Dashboard</div>
+    <div class="report-kpi-row" style="grid-template-columns:repeat(2,1fr);">
+      
+      <!-- INTUNE -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Intune</span>
+          <span class="panel-tag">Resumen</span>
+        </div>
+        <div class="panel-body" style="display:flex; flex-direction:column; gap:12px; font-size:12px; color:var(--text);">
+          
+          <div><strong>Plataformas</strong>: distribucion de dispositivos gestionados por sistema operativo, incluyendo su peso porcentual sobre el total y su nivel de cumplimiento.</div>
+          
+          <div><strong>Tipo de propiedad</strong>: clasificacion de los dispositivos en corporativos, personales o sin determinar.</div>
+          
+          <div><strong>Tipo de gestion</strong>: segmentacion segun el origen de la gestion, como Intune MDM, Microsoft Defender o Android Enterprise.</div>
+          
+          <div><strong>Estado de actualizacion</strong>: categorizacion de dispositivos en actualizados, en riesgo u obsoletos en funcion de la version detectada del sistema operativo Windows.</div>
+          
+          <div><strong>Dispositivos duplicados</strong>: identificacion de equipos con el mismo numero de serie, agrupados para detectar duplicidades, inconsistencias en los datos o posibles errores de inventario.</div>
+          
+          <div><strong>Dispositivos obsoletos en Intune</strong>: dispositivos que no han sincronizado con Intune durante mas de 90 dias. Se consideran no conformes y requieren revision.</div>
+        
+        </div>
+      </div>
+
+      <!-- ENTRA ID -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Entra ID</span>
+          <span class="panel-tag">Identidad</span>
+        </div>
+        <div class="panel-body" style="display:flex; flex-direction:column; gap:12px; font-size:12px; color:var(--text);">
+          
+          <div><strong>HAADJ</strong>: dispositivos unidos a Active Directory local y sincronizados con Entra ID (Hybrid Azure AD Join).</div>
+          
+          <div><strong>AADJ</strong>: dispositivos unidos directamente a Entra ID (Azure AD Join).</div>
+          
+          <div><strong>Registered</strong>: dispositivos registrados en Entra ID, habitualmente escenarios BYOD o movilidad ligera. Se recomienda revision si estan inscritos en MDM.</div>
+          
+          <div><strong>Huerfanos</strong>: objetos de dispositivos presentes en Active Directory local sin correspondencia con un dispositivo activo. Se recomienda su revision y eliminacion si procede.</div>
+          
+          <div><strong>Office365Mobile</strong>: dispositivos asociados a usuarios sin licencia asignada.</div>
+          
+          <div><strong>Registered sin MDM</strong>: dispositivos registrados en Entra ID sin gestion mediante MDM, normalmente en escenarios BYOD.</div>
+          
+          <div><strong>Obsoletos Entra</strong>: dispositivos que no han mostrado actividad durante un periodo superior a 6 meses.</div>
+          
+          <div><strong>Correccion de identidad</strong>: dispositivos presentes en Entra ID e Intune cuya identidad no esta completamente alineada, requiriendo acciones de correccion.</div>
+          
+          <div><strong>Solo MDE</strong>: dispositivos gestionados exclusivamente mediante Microsoft Defender for Endpoint, sin inscripcion en Intune.</div>
+          
+          <div><strong>Duplicados en Entra ID</strong>: dispositivos registrados con el mismo nombre, lo que puede indicar duplicidades o inconsistencias.</div>
+        
+        </div>
+      </div>
+
+      <!-- INTERACCION -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Interaccion</span>
+          <span class="panel-tag">Uso</span>
+        </div>
+        <div class="panel-body" style="display:flex; flex-direction:column; gap:12px; font-size:12px; color:var(--text);">
+          
+          <div><strong>Tarjetas</strong>: al seleccionar una tarjeta, se muestra el detalle filtrado correspondiente.</div>
+          
+          <div><strong>Leyendas y barras</strong>: los elementos interactivos permiten acceder al listado asociado al hacer clic.</div>
+          
+          <div><strong>Paginacion</strong>: los listados extensos se presentan en paginas para facilitar su analisis.</div>
+          
+          <div><strong>Busqueda</strong>: permite filtrar dinamicamente el contenido visible dentro de cada panel sin necesidad de recargar la pagina.</div>
+        
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
 <footer class="footer" style="display:flex; align-items:center; justify-content:space-between;">
   
   <!-- IZQUIERDA -->
   <div style="flex:1; display:flex; flex-direction:column; gap:2px;">
-    <div class="footer-text">Auditoria parque informatico v1.0 &#x2022; $nombreCliente &#x2022; Assessment actualizado: $fechaReporte</div>
+    <div class="footer-text">Microsoft Graph API v1.0 &#x2022; $nombreCliente &#x2022; Assessment: $fechaReporte</div>
     <div class="footer-text" style="color:var(--blue);">Elaborado por: $autorInforme &#x2022; $anioCreacion</div>
   </div>
 
@@ -1732,10 +1613,7 @@ const DATA = {
   android: ensureArray($jsonAndroid),
   ios:     ensureArray($jsoniOS),
   macos:   ensureArray($jsonMac),
-  entra:   ensureArray($jsonEntra),
-  risky:   ensureArray($jsonRisky),
-  ca:      ensureArray($jsonCA),
-  compliancePolicies: ensureArray($jsonCompliancePolicies)
+  entra:   ensureArray($jsonEntra)
 };
 // Sets de IDs y nombres Intune para cruce rapido O(1) en filtro huerfanos
 var INTUNE_IDS   = new Set(ensureArray($jsonIntuneIds).map(function(x){ return String(x).toLowerCase(); }));
@@ -1798,11 +1676,18 @@ var PAGE_SIZE = 25;
 var intunePage = 1;
 var filteredIntuneData = [];
 
+function isSystemUpn(upn) {
+  if (!upn) return true;
+  var u = upn.toLowerCase();
+  return /^(scep|cert|system|enrollment|autopilot|intune|device|noreply|no-reply|test|svc|service)[^@]*@/.test(u) ||
+         /\.(sys|svc|cert|scep|bot)@/.test(u);
+}
+
 function showPanel(platform) {
   currentPlatform = platform;
-  var devs = DATA[platform] || [];
+  var devs = (DATA[platform] || []).filter(function(d) { return !isSystemUpn(d.userPrincipalName); });
   document.getElementById('panelTitle').textContent = 'Dispositivos - ' + platformNames[platform];
-  document.getElementById('panelCount').textContent = devs.length + ' dispositivos';
+  document.getElementById('panelCount').textContent = devs.length + ' dispositivos (usuarios)';
   document.getElementById('searchInput').value = '';
   updateIntuneView(devs);
   var panel = document.getElementById('devicePanel');
@@ -1857,7 +1742,8 @@ function changeIntunePage(step) {
 
 function filterDevices() {
   var q = document.getElementById('searchInput').value.toLowerCase();
-  var devs = (DATA[currentPlatform] || []).filter(function(d) {
+  var base = (DATA[currentPlatform] || []).filter(function(d) { return !isSystemUpn(d.userPrincipalName); });
+  var devs = base.filter(function(d) {
     return (d.deviceName||'').toLowerCase().indexOf(q) >= 0 ||
            (d.userPrincipalName||'').toLowerCase().indexOf(q) >= 0 ||
            (d.operatingSystem||'').toLowerCase().indexOf(q) >= 0;
@@ -1946,6 +1832,7 @@ function isSoloMde(d) {
   // managementType === MicrosoftSense y tiene fecha de registro (no huerfano)
   return (d.managementType || '').toLowerCase() === 'microsoftsense';
 }
+  
 function isObsoletoEntra(d) {
   // Los que no tienen lastSignIn se clasifican como huerfanos/MDE, no como obsoletos
   if (!d.lastSignIn || d.lastSignIn === '') return false;
@@ -2266,7 +2153,7 @@ function copyReport() {
   var hu   = document.getElementById('rptHuerfanos')  ? document.getElementById('rptHuerfanos').textContent  : '-';
   var o365 = document.getElementById('rptO365Mobile') ? document.getElementById('rptO365Mobile').textContent : '-';
   var cor  = document.getElementById('rptCorreccion') ? document.getElementById('rptCorreccion').textContent : '-';
-  var txt = 'ASSESSMENT - $nombreCliente\nFecha: $fechaReporte\n--------------------------\nINTUNE\n  Total: $cntTotal dispositivos\n  Windows: $cntWin ($compWin% cumplimiento)\n  Android: $cntAndroid ($compAndroid% cumplimiento)\n  iOS: $cntiOS ($compiOS% cumplimiento)\n  macOS: $cntMac ($compMac% cumplimiento)\n  Cumplimiento Global: $compGlobal%\n\nENTRA ID\n  Total registrados: $cntEntraNum\n  Hibrida (HAADJ): $cntHAADJ\n  Entra puro (AADJ): $cntEntraAD\n  Identidades en riesgo: $cntRiskyU\n  Huerfanos: ' + hu + '\n  Office 365 Mobile: ' + o365 + '\n  Correccion Identidad: ' + cor;
+  var txt = 'ASSESSMENT - $nombreCliente\nFecha: $fechaReporte\n--------------------------\nINTUNE\n  Total: $cntTotal dispositivos\n  Windows: $cntWin ($compWin% cumplimiento)\n  Android: $cntAndroid ($compAndroid% cumplimiento)\n  iOS: $cntiOS ($compiOS% cumplimiento)\n  macOS: $cntMac ($compMac% cumplimiento)\n  Cumplimiento Global: $compGlobal%\n\nENTRA ID\n  Total registrados: $cntEntraNum\n  Hibrida (HAADJ): $cntHAADJ\n  Entra puro (AADJ): $cntEntraAD\n  Huerfanos: ' + hu + '\n  Office 365 Mobile: ' + o365 + '\n  Correccion Identidad: ' + cor;
   navigator.clipboard.writeText(txt).catch(function() { alert(txt); });
 }
 
@@ -2410,22 +2297,48 @@ function classifyWindows(ver) {
   if (!ver) return 'warn';
   var prefix = getWinBuildPrefix(ver);
   var entry  = WIN_LATEST[prefix];
+  var monthBaseline = WIN_MONTH_BASELINE[prefix];
 
-  // Rama desconocida (anterior a W10 22H2) -> directamente obsoleto
+  // Si no conocemos la rama, la tratamos como obsoleta
   if (!entry) return 'old';
 
-  // Rama EoS: si ademas le falta la ultima build B -> obsoleto; si esta al dia -> en riesgo
-  if (entry.eol) {
-    return cmpVer(ver, entry.build) >= 0 ? 'warn' : 'old';
+  var isWindows10 = prefix.indexOf('10.0.1904') === 0;
+  var isWindows11 = !isWindows10;
+
+  // Windows 10:
+  // - 22H2 (19045) siempre "en riesgo", incluso si va al dia
+  // - resto de ramas Windows 10, obsoleto
+  if (isWindows10) {
+    if (prefix === '10.0.19045') {
+      var w10Latest = parseVer(monthBaseline || entry.build);
+      var w10Parts  = parseVer(ver);
+      var w10RevDiff = (w10Latest[3] || 0) - (w10Parts[3] || 0);
+      return w10RevDiff <= 1000 ? 'warn' : 'old';
+    }
+    return 'old';
   }
 
-  // Rama activa: comparar build completa contra la ultima B publicada
-  if (cmpVer(ver, entry.build) >= 0) return 'current';
-  var verParts    = parseVer(ver);
-  var latestParts = parseVer(entry.build);
-  var revDiff = (latestParts[3] || 0) - (verParts[3] || 0);
-  // Margen de 1 ciclo mensual (~500-800 puntos de revision)
-  return revDiff <= 1000 ? 'warn' : 'old';
+  // Windows 11:
+  // - ramas activas: ultima build B del mes actual => actualizado
+  // - ramas EoS: aunque esten al dia, en riesgo
+  // - un ciclo mensual por detras => en riesgo
+  // - mas atras => obsoleto
+  if (isWindows11) {
+    if (entry.eol) {
+      if (monthBaseline && cmpVer(ver, monthBaseline) >= 0) return 'warn';
+      var eolLatestParts = parseVer(monthBaseline || entry.build);
+      var eolVerParts    = parseVer(ver);
+      var eolRevDiff     = (eolLatestParts[3] || 0) - (eolVerParts[3] || 0);
+      return eolRevDiff <= 1000 ? 'warn' : 'old';
+    }
+    if (monthBaseline && cmpVer(ver, monthBaseline) >= 0) return 'current';
+    var latestParts = parseVer(monthBaseline || entry.build);
+    var verParts    = parseVer(ver);
+    var revDiff     = (latestParts[3] || 0) - (verParts[3] || 0);
+    return revDiff <= 1000 ? 'warn' : 'old';
+  }
+
+  return 'warn';
 }
 
 function classifyDevice(d) {
@@ -2460,6 +2373,15 @@ var MGMT_GROUPS = [
     match: function(a) { return a === 'googleCloudDevicePolicyController'; } },
   { key: 'other',    label: 'Otro / Desconocido',       color: '#64748b',
     match: function(a) { return true; } } // catch-all
+];
+
+var MGMT_DISPLAY = [
+  { key: 'mde',  label: 'Defender (MDE)', color: '#a78bfa',
+    match: function(a) { return a === 'msSense'; } },
+  { key: 'mdm',  label: 'Intune (MDM)',   color: '#63b3ed',
+    match: function(a) { return a === 'mdm' || a === 'easMdm' || a === 'easmdm'; } },
+  { key: 'gcp',  label: 'Android Enterprise', color: '#68d391',
+    match: function(a) { return a === 'googleCloudDevicePolicyController'; } }
 ];
 
 function getMgmtGroup(agent) {
@@ -2505,14 +2427,6 @@ function initObsolescencia() {
   document.getElementById('obsLblOld').textContent     = 'Obs. ' + Math.round(old.length/total*100) + '%';
 
   // --- Tarjeta tipo de gestion (todos los dispositivos, 3 tipos fijos) ---
-  var MGMT_DISPLAY = [
-    { key: 'mde',  label: 'Defender (MDE)', color: '#a78bfa',
-      match: function(a) { return a === 'msSense'; } },
-    { key: 'mdm',  label: 'Intune (MDM)',   color: '#63b3ed',
-      match: function(a) { return a === 'mdm' || a === 'easMdm' || a === 'easmdm'; } },
-    { key: 'gcp',  label: 'Android Enterprise', color: '#68d391',
-      match: function(a) { return a === 'googleCloudDevicePolicyController'; } }
-  ];
   var allDevices = [].concat(DATA.windows||[], DATA.android||[], DATA.ios||[], DATA.macos||[]);
   var mgmtCount = {};
   allDevices.forEach(function(d) {
@@ -2544,13 +2458,13 @@ function initObsolescencia() {
 }
 
 function showObsPanel(filter) {
-  // Solo Windows gestionados por Intune MDM puro (managementAgent === mdm)
-  var winMdm = (DATA.windows||[]).filter(function(d) {
-    var agent = (d.managementAgent || '').trim().toLowerCase();
-    return agent === 'mdm';
+  // Mismo alcance que la tarjeta de actualizacion: Windows gestionados por Intune o co-management
+  var intuneAgents = ['mdm','easmdm','easMdm','configurationManagerClientMdm','configurationManagerClientMdmEas'];
+  var winManaged = (DATA.windows||[]).filter(function(d) {
+    return intuneAgents.indexOf((d.managementAgent || '').trim()) >= 0;
   });
   var titles = { current: 'Dispositivos Actualizados', warn: 'Dispositivos en Riesgo', old: 'Dispositivos Obsoletos' };
-  obsFilteredData = winMdm.filter(function(d) { return (d._obsClass || classifyDevice(d)) === filter; });
+  obsFilteredData = winManaged.filter(function(d) { return (d._obsClass || classifyDevice(d)) === filter; });
   obsPage = 1;
   document.getElementById('obsDetailTitle').textContent = titles[filter];
   document.getElementById('obsDetailCount').textContent = obsFilteredData.length + ' dispositivos';
@@ -2973,285 +2887,6 @@ function cumplStatusBadge(status) {
   return map[status] || '<span class="badge badge-muted">' + (status||'-') + '</span>';
 }
 
-function setCumplFilter(platform, btn) {
-  document.querySelectorAll('#tab-cumplimiento .ver-plat-btn').forEach(function(b){ b.classList.remove('active'); });
-  if (btn && btn.classList && btn.classList.contains('ver-plat-btn')) btn.classList.add('active');
-  cumplActivePlatform = platform;
-  document.getElementById('cumplDevPanel').style.display = 'none';
-  renderCumplPolicies();
-}
-
-function initCumplimiento() {
-  var policies = DATA.compliancePolicies || [];
-
-  // ---- KPIs por plataforma ----
-  var platMap = {};
-  policies.forEach(function(p) {
-    var plat = p.platform || 'Otro';
-    if (!platMap[plat]) platMap[plat] = { compliant:0, nonCompliant:0, error:0, unknown:0, grace:0, policyCount:0 };
-    platMap[plat].policyCount  += 1;
-    platMap[plat].compliant    += p.compliantCount    || 0;
-    platMap[plat].nonCompliant += p.nonCompliantCount || 0;
-    platMap[plat].error        += p.errorCount        || 0;
-    platMap[plat].unknown      += p.unknownCount      || 0;
-    platMap[plat].grace        += p.gracePeriodCount  || 0;
-  });
-
-  // Badge global en tab
-  var totalPolicies = policies.length;
-  var el = document.getElementById('tabBadgeCumpl');
-  if (el) el.textContent = totalPolicies + ' directivas';
-
-  // KPI cards
-  var kpiGrid = document.getElementById('cumplKpiGrid');
-  if (!kpiGrid) return;
-  if (Object.keys(platMap).length === 0) {
-    kpiGrid.innerHTML = '<div style="grid-column:span 5; font-family:var(--mono); font-size:12px; color:var(--muted); padding:20px; text-align:center;">Sin datos de directivas de cumplimiento (requiere DeviceManagementConfiguration.Read.All)</div>';
-    return;
-  }
-
-  var kpiHtml = '';
-  var platOrder = ['Windows','Windows 8.1','Windows Mobile','Android','Android Enterprise','iOS','macOS','Otro'];
-  var allPlats = platOrder.filter(function(p){ return platMap[p]; })
-                          .concat(Object.keys(platMap).filter(function(p){ return platOrder.indexOf(p) < 0; }));
-
-  allPlats.forEach(function(plat) {
-    var d = platMap[plat];
-    var total = d.compliant + d.nonCompliant + d.error + d.unknown + d.grace;
-    var pctOk = total > 0 ? Math.round(d.compliant/total*100) : 0;
-    var col = getPlatColor(plat);
-    var pctColor = pctOk >= 80 ? 'var(--green)' : pctOk >= 50 ? 'var(--orange)' : total > 0 ? 'var(--red)' : 'var(--muted)';
-    kpiHtml +=
-      '<div style="background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:18px; position:relative; overflow:hidden; cursor:pointer; transition:border-color .2s;" ' +
-           'onclick="setCumplFilter(\'' + plat + '\', this)" ' +
-           'onmouseover="this.style.borderColor=\'var(--border2)\'" onmouseout="this.style.borderColor=\'var(--border)\'">' +
-        '<div style="position:absolute;top:0;left:0;right:0;height:2px;background:' + col + ';opacity:.8;"></div>' +
-        '<div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:10px;">' +
-          '<div style="font-family:var(--mono); font-size:9px; letter-spacing:1.5px; text-transform:uppercase; color:var(--muted);">' + plat + '</div>' +
-          '<div style="font-family:var(--mono); font-size:9px; color:var(--muted); background:rgba(255,255,255,0.05); padding:2px 6px; border-radius:4px;">' + d.policyCount + ' dir.</div>' +
-        '</div>' +
-        '<div style="font-size:32px; font-weight:700; letter-spacing:-1px; color:' + pctColor + '; line-height:1; margin-bottom:4px;">' + (total > 0 ? pctOk + '%' : '-') + '</div>' +
-        '<div style="font-family:var(--mono); font-size:10px; color:var(--muted); margin-bottom:10px;">' + (total > 0 ? total + ' dispositivos' : 'Sin datos') + '</div>' +
-        '<div style="height:4px; background:rgba(255,255,255,0.06); border-radius:4px; overflow:hidden; margin-bottom:10px; display:flex;">' +
-          '<div style="height:100%; width:' + (total>0?Math.round(d.compliant/total*100):0) + '%; background:var(--green); border-radius:4px 0 0 4px;"></div>' +
-          '<div style="height:100%; width:' + (total>0?Math.round(d.nonCompliant/total*100):0) + '%; background:var(--red);"></div>' +
-          '<div style="height:100%; width:' + (total>0?Math.round((d.error+d.unknown+d.grace)/total*100):0) + '%; background:var(--orange); border-radius:0 4px 4px 0;"></div>' +
-        '</div>' +
-        '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
-          '<span style="font-family:var(--mono); font-size:9px; color:var(--green);">&#10003; ' + d.compliant + '</span>' +
-          '<span style="font-family:var(--mono); font-size:9px; color:var(--red);">&#x2715; ' + d.nonCompliant + '</span>' +
-          (d.error > 0 ? '<span style="font-family:var(--mono); font-size:9px; color:var(--orange);">! ' + d.error + '</span>' : '') +
-          (d.grace > 0 ? '<span style="font-family:var(--mono); font-size:9px; color:var(--muted);">~ ' + d.grace + '</span>' : '') +
-        '</div>' +
-      '</div>';
-  });
-  kpiGrid.innerHTML = kpiHtml;
-  kpiGrid.style.gridTemplateColumns = 'repeat(' + Math.min(allPlats.length, 5) + ',1fr)';
-
-  renderCumplPolicies();
-}
-
-function renderCumplPolicies() {
-  var container = document.getElementById('cumplPoliciesList');
-  if (!container) return;
-
-  var policies = (DATA.compliancePolicies || []).filter(function(p) {
-    if (cumplActivePlatform === 'all') return true;
-    return (p.platform || '').toLowerCase().indexOf(cumplActivePlatform.toLowerCase()) >= 0;
-  });
-
-  if (policies.length === 0) {
-    container.innerHTML = '<div style="font-family:var(--mono); font-size:12px; color:var(--muted); padding:20px; text-align:center;">Sin directivas para esta plataforma</div>';
-    return;
-  }
-
-  var html = '';
-  policies.forEach(function(pol) {
-    var col       = getPlatColor(pol.platform);
-    var total     = (pol.compliantCount||0) + (pol.nonCompliantCount||0) + (pol.errorCount||0) + (pol.unknownCount||0) + (pol.gracePeriodCount||0);
-    var pctOk     = total > 0 ? Math.round((pol.compliantCount||0)/total*100) : 0;
-    var polSafeId = pol.id.replace(/[^a-zA-Z0-9]/g,'_');
-
-    // Settings no conformes ordenadas de mayor a menor impacto
-    var badSettings = (pol.settings || [])
-      .filter(function(s){ return (s.nonCompliantCount||0) + (s.errorCount||0) + (s.conflictCount||0) > 0; })
-      .sort(function(a,b){ return ((b.nonCompliantCount||0)+(b.errorCount||0)) - ((a.nonCompliantCount||0)+(a.errorCount||0)); });
-
-    // Nombre legible del setting
-    function fmtSetting(name) {
-      return (name || '-')
-        .replace(/^.*\//,'')
-        .replace(/([A-Z])/g,' $1')
-        .replace(/^deviceCompliancePolicy\s*/i,'')
-        .trim();
-    }
-
-    html +=
-      '<div class="panel" style="margin-bottom:16px;">' +
-        '<div class="panel-header" style="cursor:pointer;" onclick="toggleCumplPolicy(\'' + polSafeId + '\')">' +
-          '<div style="display:flex; align-items:center; gap:12px; flex:1; min-width:0;">' +
-            '<span style="width:10px;height:10px;border-radius:50%;background:' + col + ';flex-shrink:0;display:inline-block;"></span>' +
-            '<div style="min-width:0;">' +
-              '<div style="font-size:13px; font-weight:600; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + (pol.displayName||'-') + '</div>' +
-              '<div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:2px;">' + (pol.platform||'-') + '</div>' +
-            '</div>' +
-          '</div>' +
-          '<div style="display:flex; align-items:center; gap:10px; flex-shrink:0;">' +
-            '<div style="text-align:right;">' +
-              '<div style="font-family:var(--mono); font-size:18px; font-weight:700; color:' + (pctOk >= 80 ? 'var(--green)' : pctOk >= 50 ? 'var(--orange)' : 'var(--red)') + ';">' + pctOk + '%</div>' +
-              '<div style="font-family:var(--mono); font-size:9px; color:var(--muted);">' + total + ' disp.</div>' +
-            '</div>' +
-            '<div style="display:flex; flex-direction:column; gap:3px; min-width:120px;">' +
-              '<div style="height:5px; background:rgba(255,255,255,0.06); border-radius:3px; overflow:hidden; display:flex;">' +
-                '<div style="height:100%; width:' + pctOk + '%; background:var(--green);"></div>' +
-                '<div style="height:100%; width:' + (total>0?Math.round((pol.nonCompliantCount||0)/total*100):0) + '%; background:var(--red);"></div>' +
-                '<div style="height:100%; width:' + (total>0?Math.round(((pol.errorCount||0)+(pol.unknownCount||0)+(pol.gracePeriodCount||0))/total*100):0) + '%; background:var(--orange);"></div>' +
-              '</div>' +
-              '<div style="display:flex; gap:8px;">' +
-                '<span style="font-family:var(--mono); font-size:9px; color:var(--green);">&#10003; ' + (pol.compliantCount||0) + '</span>' +
-                '<span style="font-family:var(--mono); font-size:9px; color:var(--red);">&#x2715; ' + (pol.nonCompliantCount||0) + '</span>' +
-                (pol.errorCount > 0 ? '<span style="font-family:var(--mono); font-size:9px; color:var(--orange);">! ' + pol.errorCount + '</span>' : '') +
-                (pol.gracePeriodCount > 0 ? '<span style="font-family:var(--mono); font-size:9px; color:var(--muted);">~ ' + pol.gracePeriodCount + '</span>' : '') +
-              '</div>' +
-            '</div>' +
-            '<span style="font-family:var(--mono); font-size:14px; color:var(--muted);" id="cumpl-arrow-' + polSafeId + '">&#9654;</span>' +
-          '</div>' +
-        '</div>' +
-
-        // Cuerpo colapsable
-        '<div id="cumpl-body-' + polSafeId + '" style="display:none;">' +
-          '<div style="padding:16px 20px; border-bottom:1px solid var(--border); display:flex; gap:10px; flex-wrap:wrap; align-items:center;">' +
-            '<span style="font-family:var(--mono); font-size:10px; color:var(--muted);">Settings no conformes:</span>' +
-            (badSettings.length === 0 ?
-              '<span style="font-family:var(--mono); font-size:11px; color:var(--green);">Sin settings incumplidos &#10003;</span>' :
-              '<span style="font-family:var(--mono); font-size:10px; color:var(--muted);">' + badSettings.length + ' settings con incumplimientos</span>') +
-            (pol.devices && pol.devices.length > 0 ?
-              '<button class="export-btn" style="font-size:10px; padding:4px 10px; margin-left:auto;" onclick="showCumplDevPanel(\'' + polSafeId + '\')">Ver ' + pol.devices.length + ' dispositivos &#x2192;</button>' : '') +
-          '</div>' +
-
-          // Tabla de settings
-          (badSettings.length > 0 ?
-            '<div style="overflow-x:auto;">' +
-            '<table style="width:100%; border-collapse:collapse; font-size:12px;">' +
-              '<thead><tr>' +
-                '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:left; padding:10px 16px 8px; border-bottom:1px solid var(--border);">Setting</th>' +
-                '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:center; padding:10px 12px 8px; border-bottom:1px solid var(--border); width:90px;">No Conforme</th>' +
-                '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:center; padding:10px 12px 8px; border-bottom:1px solid var(--border); width:80px;">Error</th>' +
-                '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:center; padding:10px 12px 8px; border-bottom:1px solid var(--border); width:80px;">Conflicto</th>' +
-                '<th style="font-family:var(--mono); font-size:9px; letter-spacing:1.2px; text-transform:uppercase; color:var(--muted); text-align:left; padding:10px 12px 8px; border-bottom:1px solid var(--border);">Impacto</th>' +
-              '</tr></thead>' +
-              '<tbody>' +
-                badSettings.map(function(s) {
-                  var impact = (s.nonCompliantCount||0) + (s.errorCount||0) + (s.conflictCount||0);
-                  var impactPct = total > 0 ? Math.round(impact/total*100) : 0;
-                  var barCol = impactPct >= 50 ? 'var(--red)' : impactPct >= 20 ? 'var(--orange)' : 'var(--muted)';
-                  return '<tr style="border-bottom:1px solid rgba(255,255,255,0.04);">' +
-                    '<td style="padding:10px 16px; color:var(--text); max-width:300px;">' +
-                      '<div style="font-weight:500; font-size:12px;">' + fmtSetting(s.settingName) + '</div>' +
-                      '<div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:2px; word-break:break-all;">' + (s.settingName||'') + '</div>' +
-                    '</td>' +
-                    '<td style="padding:10px 12px; text-align:center;">' +
-                      (s.nonCompliantCount > 0 ? '<span style="font-family:var(--mono); font-size:13px; font-weight:700; color:var(--red);">' + s.nonCompliantCount + '</span>' : '<span style="color:var(--muted);">-</span>') +
-                    '</td>' +
-                    '<td style="padding:10px 12px; text-align:center;">' +
-                      (s.errorCount > 0 ? '<span style="font-family:var(--mono); font-size:13px; font-weight:700; color:var(--orange);">' + s.errorCount + '</span>' : '<span style="color:var(--muted);">-</span>') +
-                    '</td>' +
-                    '<td style="padding:10px 12px; text-align:center;">' +
-                      (s.conflictCount > 0 ? '<span style="font-family:var(--mono); font-size:13px; font-weight:700; color:var(--orange);">' + s.conflictCount + '</span>' : '<span style="color:var(--muted);">-</span>') +
-                    '</td>' +
-                    '<td style="padding:10px 12px;">' +
-                      '<div style="display:flex; align-items:center; gap:8px;">' +
-                        '<div style="flex:1; height:5px; background:rgba(255,255,255,0.06); border-radius:3px; overflow:hidden; min-width:60px;">' +
-                          '<div style="height:100%; width:' + impactPct + '%; background:' + barCol + '; border-radius:3px;"></div>' +
-                        '</div>' +
-                        '<span style="font-family:var(--mono); font-size:10px; color:' + barCol + '; min-width:32px; text-align:right;">' + impactPct + '%</span>' +
-                      '</div>' +
-                    '</td>' +
-                  '</tr>';
-                }).join('') +
-              '</tbody>' +
-            '</table></div>' : '') +
-        '</div>' +
-      '</div>';
-  });
-
-  // Guardar referencia para el panel de dispositivos
-  window._cumplPoliciesRendered = policies;
-  container.innerHTML = html;
-}
-
-function toggleCumplPolicy(safeId) {
-  var body  = document.getElementById('cumpl-body-' + safeId);
-  var arrow = document.getElementById('cumpl-arrow-' + safeId);
-  if (!body) return;
-  var isOpen = body.style.display !== 'none';
-  body.style.display  = isOpen ? 'none' : 'block';
-  if (arrow) arrow.innerHTML = isOpen ? '&#9654;' : '&#9660;';
-}
-
-function showCumplDevPanel(polSafeId) {
-  var policies = window._cumplPoliciesRendered || [];
-  var pol = policies.filter(function(p){ return p.id.replace(/[^a-zA-Z0-9]/g,'_') === polSafeId; })[0];
-  if (!pol) return;
-  cumplDevAllData  = pol.devices || [];
-  cumplDevFiltered = cumplDevAllData.slice();
-  cumplDevPage     = 1;
-  document.getElementById('cumplDevTitle').textContent = 'No conformes: ' + pol.displayName;
-  document.getElementById('cumplDevCount').textContent = cumplDevFiltered.length + ' dispositivos';
-  document.getElementById('searchCumplDev').value = '';
-  renderCumplDevPage();
-  var panel = document.getElementById('cumplDevPanel');
-  panel.style.display = 'block';
-  panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
-}
-
-function filterCumplDevices() {
-  var q = document.getElementById('searchCumplDev').value.toLowerCase();
-  cumplDevFiltered = cumplDevAllData.filter(function(d) {
-    return (d.deviceName||'').toLowerCase().indexOf(q) >= 0 ||
-           (d.upn||'').toLowerCase().indexOf(q) >= 0;
-  });
-  cumplDevPage = 1;
-  document.getElementById('cumplDevCount').textContent = cumplDevFiltered.length + ' dispositivos';
-  renderCumplDevPage();
-}
-
-function renderCumplDevPage() {
-  var tbody = document.getElementById('cumplDevBody');
-  var totalPages = Math.ceil(cumplDevFiltered.length / PAGE_SIZE) || 1;
-  var start    = (cumplDevPage - 1) * PAGE_SIZE;
-  var pageData = cumplDevFiltered.slice(start, start + PAGE_SIZE);
-
-  document.getElementById('cumplDevPageInd').textContent = 'Pagina ' + cumplDevPage + ' de ' + totalPages;
-  document.getElementById('cumplDevPrev').disabled = (cumplDevPage === 1);
-  document.getElementById('cumplDevNext').disabled = (cumplDevPage === totalPages);
-  document.getElementById('cumplDevPrev').style.opacity = (cumplDevPage === 1) ? '0.4' : '1';
-  document.getElementById('cumplDevNext').style.opacity = (cumplDevPage === totalPages) ? '0.4' : '1';
-
-  if (pageData.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color:var(--muted); padding:20px; font-family:var(--mono)">Sin dispositivos</td></tr>';
-    return;
-  }
-  tbody.innerHTML = pageData.map(function(d) {
-    return '<tr>' +
-      '<td style="font-weight:600">' + (d.deviceName||'-') + '</td>' +
-      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + (d.upn||'-') + '</td>' +
-      '<td>' + cumplStatusBadge(d.status) + '</td>' +
-      '<td style="font-family:var(--mono); font-size:11px; color:var(--muted)">' + fmtDate(d.lastReported) + '</td>' +
-      '</tr>';
-  }).join('');
-}
-
-function changeCumplDevPage(step) {
-  var totalPages = Math.ceil(cumplDevFiltered.length / PAGE_SIZE) || 1;
-  var np = cumplDevPage + step;
-  if (np >= 1 && np <= totalPages) {
-    cumplDevPage = np;
-    renderCumplDevPage();
-    document.getElementById('cumplDevPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }
-}
-
 // =====================================================================
 // PANEL TIPO DE PROPIEDAD
 // =====================================================================
@@ -3265,7 +2900,8 @@ var OWNER_COLORS = { company: 'var(--blue)', personal: 'var(--orange)', unknown:
 function showOwnerPanel(ownerType) {
   var allDevices = [].concat(
     DATA.windows || [], DATA.android || [], DATA.ios || [], DATA.macos || []
-  );
+  ).filter(function(d) { return !isSystemUpn(d.userPrincipalName); });
+
   var filtered = allDevices.filter(function(d) {
     var t = (d.managedDeviceOwnerType || '').toLowerCase();
     if (ownerType === 'company')  return t === 'company';
@@ -3285,7 +2921,7 @@ function showOwnerPanel(ownerType) {
 
   var panel = document.getElementById('ownerPanel');
   panel.style.display = 'block';
-  panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  setTimeout(function() { panel.scrollIntoView({ behavior:'smooth', block:'start' }); }, 50);
 }
 
 function filterOwnerDevices() {
@@ -3342,67 +2978,13 @@ function changeOwnerPage(step) {
 // =====================================================================
 // REPORTE EJECUTIVO — SECCION CUMPLIMIENTO
 // =====================================================================
-function initReporteCumplimiento() {
-  var policies = DATA.compliancePolicies || [];
-  if (policies.length === 0) return;
-
-  var totalCompliant    = 0, totalNonCompliant = 0, totalError = 0, totalUnknown = 0;
-  policies.forEach(function(p) {
-    totalCompliant    += p.compliantCount    || 0;
-    totalNonCompliant += p.nonCompliantCount || 0;
-    totalError        += p.errorCount        || 0;
-    totalUnknown      += (p.unknownCount || 0) + (p.gracePeriodCount || 0);
-  });
-
-  var el = function(id) { return document.getElementById(id); };
-  if (el('rptCumplTotal'))       el('rptCumplTotal').textContent       = policies.length;
-  if (el('rptCumplCompliant'))   el('rptCumplCompliant').textContent   = totalCompliant;
-  if (el('rptCumplNonCompliant'))el('rptCumplNonCompliant').textContent= totalNonCompliant;
-  if (el('rptCumplError'))       el('rptCumplError').textContent       = totalError + totalUnknown;
-  if (el('rptCumplTag'))         el('rptCumplTag').textContent         = policies.length + ' directivas';
-
-  // Tabla por directiva
-  var tbody = el('rptCumplBody');
-  if (!tbody) return;
-  var rows = policies
-    .slice()
-    .sort(function(a, b) { return (b.nonCompliantCount||0) - (a.nonCompliantCount||0); })
-    .map(function(pol) {
-      var total  = (pol.compliantCount||0) + (pol.nonCompliantCount||0) + (pol.errorCount||0) + (pol.unknownCount||0) + (pol.gracePeriodCount||0);
-      var pctOk  = total > 0 ? Math.round((pol.compliantCount||0) / total * 100) : 0;
-      var col    = getPlatColor(pol.platform);
-      var barCol = pctOk >= 80 ? 'var(--green)' : pctOk >= 50 ? 'var(--orange)' : total > 0 ? 'var(--red)' : 'var(--muted)';
-      return '<tr style="cursor:pointer;" onclick="switchTab(\'cumplimiento\', document.querySelector(\'.tab:nth-child(3)\'))" title="Ver en pestaña Cumplimiento">' +
-        '<td style="font-weight:600; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + (pol.displayName || '-') + '</td>' +
-        '<td><span style="font-family:var(--mono); font-size:10px; color:' + col + '; background:rgba(255,255,255,0.05); padding:2px 7px; border-radius:4px;">' + (pol.platform || '-') + '</span></td>' +
-        '<td style="text-align:center; font-family:var(--mono); font-weight:700; color:var(--green);">'  + (pol.compliantCount    || 0) + '</td>' +
-        '<td style="text-align:center; font-family:var(--mono); font-weight:700; color:var(--red);">'    + (pol.nonCompliantCount || 0) + '</td>' +
-        '<td style="text-align:center; font-family:var(--mono); font-weight:700; color:var(--orange);">' + (pol.errorCount        || 0) + '</td>' +
-        '<td style="text-align:center; font-family:var(--mono); color:var(--muted);">'                   + ((pol.unknownCount||0) + (pol.gracePeriodCount||0)) + '</td>' +
-        '<td>' +
-          '<div style="display:flex; align-items:center; gap:8px;">' +
-            '<div style="flex:1; height:5px; background:rgba(255,255,255,0.06); border-radius:3px; overflow:hidden; min-width:60px;">' +
-              '<div style="height:100%; width:' + pctOk + '%; background:' + barCol + '; border-radius:3px; transition:width .4s;"></div>' +
-            '</div>' +
-            '<span style="font-family:var(--mono); font-size:11px; color:' + barCol + '; min-width:36px; text-align:right; font-weight:700;">' + (total > 0 ? pctOk + '%' : '-') + '</span>' +
-          '</div>' +
-        '</td>' +
-      '</tr>';
-    });
-  tbody.innerHTML = rows.join('') || '<tr><td colspan="7" style="text-align:center; color:var(--muted); padding:20px; font-family:var(--mono); font-size:12px;">Sin datos de directivas</td></tr>';
-}
-
 // ---- INIT ----
-try { renderRiskyUsers(); }           catch(e) { console.warn('renderRiskyUsers:', e); }
-try { renderCA(); }                   catch(e) { console.warn('renderCA:', e); }
 try { initEntraDonuts(); }            catch(e) { console.warn('initEntraDonuts:', e); }
 try { initEntraCards(); }             catch(e) { console.warn('initEntraCards:', e); }
 try { initObsolescencia(); }          catch(e) { console.warn('initObsolescencia:', e); }
 try { initDuplicates(); }             catch(e) { console.warn('initDuplicates:', e); }
 try { initIntuneStale(); }            catch(e) { console.warn('initIntuneStale:', e); }
 try { initEntraDuplicates(); }        catch(e) { console.warn('initEntraDuplicates:', e); }
-try { initCumplimiento(); }           catch(e) { console.warn('initCumplimiento:', e); }
-try { initReporteCumplimiento(); }    catch(e) { console.warn('initReporteCumplimiento:', e); }
 </script>
 </body>
 </html>
@@ -3421,7 +3003,6 @@ $rotMac     = [string]($offsetMac - 90)
 
 # Alias sin ambiguedad para variables que comparten prefijo
 $cntEntraNum = [string]$cntEntra
-$cntCAPolNum = [string]$cntCAPol
 
 $html = $html.Replace('$nombreCliente',  $nombreCliente)
 $html = $html.Replace('$logoCliente',    $logoCliente)
@@ -3453,14 +3034,8 @@ $html = $html.Replace('$rotMac',      $rotMac)
 $html = $html.Replace('$cntEntraAD',  [string]$cntEntraAD)
 $html = $html.Replace('$cntEntraNum', $cntEntraNum)
 $html = $html.Replace('$cntHAADJ',    [string]$cntHAADJ)
-$html = $html.Replace('$cntRiskyU',   [string]$cntRiskyU)
-$html = $html.Replace('$cntCAPol_En', [string]$cntCAPol_En)
-$html = $html.Replace('$cntCAPolNum', $cntCAPolNum)
 # Reporte
 $html = $html.Replace('$cntNoCompliant', $cntNoCompliant)
-# MFA
-$pctMFAVal = [string]$pctMFA
-$html = $html.Replace('$pctMFAVal', $pctMFAVal)
 # Ownership / Tipo de Propiedad
 $html = $html.Replace('$cntCorporate',    [string]$cntCorporate)
 $html = $html.Replace('$cntPersonal',     [string]$cntPersonal)
@@ -3479,13 +3054,13 @@ $html = $html.Replace('$jsonAndroid', $jsonAndroid)
 $html = $html.Replace('$jsoniOS',     $jsoniOS)
 $html = $html.Replace('$jsonMac',     $jsonMac)
 $html = $html.Replace('$jsonEntra',      $jsonEntra)
-$html = $html.Replace('$jsonRisky',      $jsonRisky)
-$html = $html.Replace('$jsonCA',         $jsonCA)
 $html = $html.Replace('$jsonIntuneIds',   $jsonIntuneIds)
 $html = $html.Replace('$jsonIntuneNames', $jsonIntuneNames)
-# Sanitizar JSON de compliance: escapar </script> para evitar ruptura del bloque JS
-$jsonCompliancePoliciesSafe = $jsonCompliancePolicies -replace '</script>', '<\/script>'
-$html = $html.Replace('$jsonCompliancePolicies', $jsonCompliancePoliciesSafe)
+# Directiva por defecto
+$html = $html.Replace('$defaultPolicyNonCompl', [string]$defaultPolicyNonCompl)
+$html = $html.Replace('$defaultPolicyError',    [string]$defaultPolicyError)
+$html = $html.Replace('$defaultPolicyUnknown',  [string]$defaultPolicyUnknown)
+$html = $html.Replace('$defaultPolicyId',       $defaultPolicyId)
 $html = $html.Replace('$autorInforme',    $autorInforme)
 $html = $html.Replace('$anioCreacion',    $anioCreacion)
 # Builds Windows dinamicos
@@ -3503,8 +3078,7 @@ try {
     Write-Host "  Dashboard generado correctamente" -ForegroundColor Green
     Write-Host "  Ruta: $ruta" -ForegroundColor White
     Write-Host "  Intune: $cntTotal dispositivos - Cumplimiento global: $compGlobal%" -ForegroundColor White
-    Write-Host "  Entra ID: $cntEntra dispositivos - $cntRiskyU en riesgo" -ForegroundColor White
-    Write-Host "  Acceso Condicional: $cntCAPol politicas ($cntCAPol_En habilitadas)" -ForegroundColor White
+    Write-Host "  Entra ID: $cntEntra dispositivos registrados" -ForegroundColor White
     Write-Host "  ------------------------------------------------------------" -ForegroundColor Cyan
     Write-Host ""
     Invoke-Item $ruta
