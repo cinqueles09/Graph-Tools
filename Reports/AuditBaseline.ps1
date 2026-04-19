@@ -852,7 +852,7 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
     </div>
   </div>
   <div class="header-center">
-    <div class="header-title">Dashboard de auditoria de dispositivos</div>
+    <div class="header-title">Auditoria de dispositivos</div>
     <div class="header-subtitle">Microsoft Intune + Entra ID - Assessment Report</div>
   </div>
   <div class="header-meta">
@@ -976,7 +976,7 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
                 <div><span class="legend-count">$cntCorporate</span><span class="legend-pct">$pctCorporate%</span></div>
               </div>
               <div class="legend-row" style="cursor:pointer;" onclick="showOwnerPanel('personal')" onmouseover="this.style.background='rgba(246,173,85,0.04)'" onmouseout="this.style.background=''">
-                <div class="legend-left"><span class="legend-dot" style="background:#f6ad55"></span>Personal (BYOD)</div>
+                <div class="legend-left"><span class="legend-dot" style="background:#f6ad55"></span>Personal</div>
                 <div><span class="legend-count">$cntPersonal</span><span class="legend-pct">$pctPersonal%</span></div>
               </div>
               <div class="legend-row" style="cursor:pointer;" onclick="showOwnerPanel('unknown')" onmouseover="this.style.background='rgba(100,116,139,0.04)'" onmouseout="this.style.background=''">
@@ -1272,7 +1272,7 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
       <div class="entra-stat" onclick="showEntraPanel('o365mobile')" style="border-color:rgba(246,173,85,0.25);">
         <div class="entra-stat-label" style="color:var(--orange)">Office 365 Mobile</div>
         <div class="entra-stat-value" style="color:var(--orange)" id="cntO365Mobile">-</div>
-        <div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:6px;">MDM: Office365 (no gestionado)</div>
+        <div style="font-family:var(--mono); font-size:9px; color:var(--muted); margin-top:6px;">MDM: Office365 (Usuario sin licencia Intune)</div>
       </div>
       <div class="entra-stat" onclick="showEntraPanel('reg-sin-mdm')" style="border-color:rgba(167,139,250,0.25);">
         <div class="entra-stat-label" style="color:var(--purple)">Registered sin MDM</div>
@@ -1482,6 +1482,22 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
       </div>
     </div>
     
+    <div class="section-label" style="margin-top:8px;">Ownership</div>
+    <div class="report-kpi-row" style="grid-template-columns:repeat(3,1fr);" id="rptOwnershipRow">
+      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('intune', document.querySelector('.tab:nth-child(1)')); setTimeout(function(){ showOwnerPanel('company'); }, 100);">
+        <div class="report-kpi-val" style="color:var(--blue)">$cntCorporate</div>
+        <div class="report-kpi-lbl">&#x1F3E2; Corporativo ($pctCorporate%)</div>
+      </div>
+      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('intune', document.querySelector('.tab:nth-child(1)')); setTimeout(function(){ showOwnerPanel('personal'); }, 100);">
+        <div class="report-kpi-val" style="color:var(--orange)">$cntPersonal</div>
+        <div class="report-kpi-lbl">&#x1F464; Personal BYOD ($pctPersonal%)</div>
+      </div>
+      <div class="report-kpi" style="cursor:pointer;" onclick="switchTab('intune', document.querySelector('.tab:nth-child(1)')); setTimeout(function(){ showOwnerPanel('unknown'); }, 100);">
+        <div class="report-kpi-val" style="color:var(--muted)">$cntOwnerUnknown</div>
+        <div class="report-kpi-lbl">&#x2753; Desconocido ($pctOwnerUnknown%)</div>
+      </div>
+    </div>
+
     <div class="panel">
       <div class="panel-header">
         <span class="panel-title">Exportar Assessment</span>
@@ -1583,7 +1599,7 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
   
   <!-- IZQUIERDA -->
   <div style="flex:1; display:flex; flex-direction:column; gap:2px;">
-    <div class="footer-text">Microsoft Graph API v1.0 &#x2022; $nombreCliente &#x2022; Assessment: $fechaReporte</div>
+    <div class="footer-text">Analisis parque informatico &#x2022; $nombreCliente &#x2022; Assessment actualizado: $fechaReporte</div>
     <div class="footer-text" style="color:var(--blue);">Elaborado por: $autorInforme &#x2022; $anioCreacion</div>
   </div>
 
@@ -2151,11 +2167,68 @@ function exportCSV() {
 }
 
 function copyReport() {
-  var hu   = document.getElementById('rptHuerfanos')  ? document.getElementById('rptHuerfanos').textContent  : '-';
-  var o365 = document.getElementById('rptO365Mobile') ? document.getElementById('rptO365Mobile').textContent : '-';
-  var cor  = document.getElementById('rptCorreccion') ? document.getElementById('rptCorreccion').textContent : '-';
-  var txt = 'ASSESSMENT - $nombreCliente\nFecha: $fechaReporte\n--------------------------\nINTUNE\n  Total: $cntTotal dispositivos\n  Windows: $cntWin ($compWin% cumplimiento)\n  Android: $cntAndroid ($compAndroid% cumplimiento)\n  iOS: $cntiOS ($compiOS% cumplimiento)\n  macOS: $cntMac ($compMac% cumplimiento)\n  Cumplimiento Global: $compGlobal%\n\nENTRA ID\n  Total registrados: $cntEntraNum\n  Hibrida (HAADJ): $cntHAADJ\n  Entra puro (AADJ): $cntEntraAD\n  Huerfanos: ' + hu + '\n  Office 365 Mobile: ' + o365 + '\n  Correccion Identidad: ' + cor;
-  navigator.clipboard.writeText(txt).catch(function() { alert(txt); });
+  function getEl(id) { var el = document.getElementById(id); return el ? el.textContent.trim() : '-'; }
+
+  var lines = [];
+  lines.push('ASSESSMENT - $nombreCliente');
+  lines.push('Fecha: $fechaReporte');
+  lines.push('');
+
+  lines.push('== INTUNE ==');
+  lines.push('  Cumplimiento Global : $compGlobal%');
+  lines.push('  Total dispositivos  : $cntTotal');
+  lines.push('  No conformes        : $cntNoCompliant');
+  lines.push('  Windows             : $cntWin  ($compWin% cumplimiento)');
+  lines.push('  Android             : $cntAndroid  ($compAndroid% cumplimiento)');
+  lines.push('  iOS                 : $cntiOS  ($compiOS% cumplimiento)');
+  lines.push('  macOS               : $cntMac  ($compMac% cumplimiento)');
+  lines.push('');
+
+  lines.push('== ENTRA ID ==');
+  lines.push('  Total registrados   : $cntEntraNum');
+  lines.push('  Union Hibrida HAADJ : $cntHAADJ');
+  lines.push('  Entra puro AADJ     : $cntEntraAD');
+  lines.push('  Registered con MDM  : ' + getEl('rptRegisteredMdm'));
+  lines.push('');
+
+  lines.push('== ANOMALIAS ENTRA ID ==');
+  lines.push('  Huerfanos           : ' + getEl('rptHuerfanos'));
+  lines.push('  Office 365 Mobile   : ' + getEl('rptO365Mobile'));
+  lines.push('  Correccion Identidad: ' + getEl('rptCorreccion'));
+  lines.push('');
+
+  lines.push('== DIRECTIVA POR DEFECTO ==');
+  var defRow = document.getElementById('rptDefaultPolicyRow');
+  if (defRow) {
+    defRow.querySelectorAll('.report-kpi').forEach(function(kpi) {
+      var val = kpi.querySelector('.report-kpi-val');
+      var lbl = kpi.querySelector('.report-kpi-lbl');
+      if (val && lbl) {
+        var label = lbl.textContent.trim().replace(/^[^a-zA-Z]+/, '');
+        lines.push('  ' + label.padEnd(32) + ': ' + val.textContent.trim());
+      }
+    });
+  }
+  lines.push('');
+
+  lines.push('== OWNERSHIP ==');
+  var ownerRow = document.getElementById('rptOwnershipRow');
+  if (ownerRow) {
+    ownerRow.querySelectorAll('.report-kpi').forEach(function(kpi) {
+      var val = kpi.querySelector('.report-kpi-val');
+      var lbl = kpi.querySelector('.report-kpi-lbl');
+      if (val && lbl) {
+        var label = lbl.textContent.trim().replace(/^[^a-zA-Z]+/, '');
+        lines.push('  ' + label.padEnd(32) + ': ' + val.textContent.trim());
+      }
+    });
+  }
+
+  var out = lines.join('\n');
+  navigator.clipboard.writeText(out).then(function() {
+    var btn = document.querySelector('[onclick="copyReport()"]');
+    if (btn) { var orig = btn.textContent; btn.textContent = 'Copiado'; setTimeout(function(){ btn.textContent = orig; }, 2000); }
+  }).catch(function() { alert(out); });
 }
 
 // =====================================================================
@@ -3035,6 +3108,11 @@ $html = $html.Replace('$rotMac',      $rotMac)
 $html = $html.Replace('$cntEntraAD',  [string]$cntEntraAD)
 $html = $html.Replace('$cntEntraNum', $cntEntraNum)
 $html = $html.Replace('$cntHAADJ',    [string]$cntHAADJ)
+# Directiva por defecto — ANTES de $cntNoCompliant para evitar colision de substring
+$html = $html.Replace('$defaultPolicyNonCompl', [string]$defaultPolicyNonCompl)
+$html = $html.Replace('$defaultPolicyError',    [string]$defaultPolicyError)
+$html = $html.Replace('$defaultPolicyUnknown',  [string]$defaultPolicyUnknown)
+$html = $html.Replace('$defaultPolicyId',       $defaultPolicyId)
 # Reporte
 $html = $html.Replace('$cntNoCompliant', $cntNoCompliant)
 # Ownership / Tipo de Propiedad
@@ -3057,11 +3135,6 @@ $html = $html.Replace('$jsonMac',     $jsonMac)
 $html = $html.Replace('$jsonEntra',      $jsonEntra)
 $html = $html.Replace('$jsonIntuneIds',   $jsonIntuneIds)
 $html = $html.Replace('$jsonIntuneNames', $jsonIntuneNames)
-# Directiva por defecto
-$html = $html.Replace('$defaultPolicyNonCompl', [string]$defaultPolicyNonCompl)
-$html = $html.Replace('$defaultPolicyError',    [string]$defaultPolicyError)
-$html = $html.Replace('$defaultPolicyUnknown',  [string]$defaultPolicyUnknown)
-$html = $html.Replace('$defaultPolicyId',       $defaultPolicyId)
 $html = $html.Replace('$autorInforme',    $autorInforme)
 $html = $html.Replace('$anioCreacion',    $anioCreacion)
 # Builds Windows dinamicos
