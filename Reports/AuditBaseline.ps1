@@ -84,6 +84,7 @@ This script is provided "as is" without warranty of any kind.
 Use at your own risk.
 
 #>
+
 # ==============================================================================
 # DASHBOARD PROFESIONAL â€” INTUNE + ENTRA ID ASSESSMENT
 # ==============================================================================
@@ -1832,7 +1833,7 @@ function isSoloMde(d) {
   // managementType === MicrosoftSense y tiene fecha de registro (no huerfano)
   return (d.managementType || '').toLowerCase() === 'microsoftsense';
 }
-  
+
 function isObsoletoEntra(d) {
   // Los que no tienen lastSignIn se clasifican como huerfanos/MDE, no como obsoletos
   if (!d.lastSignIn || d.lastSignIn === '') return false;
