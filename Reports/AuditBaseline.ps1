@@ -41,9 +41,6 @@ This script uses Microsoft Graph API with Application Permissions (App Registrat
     - Device.Read.All
     - DeviceManagementConfiguration.Read.All
     - DeviceManagementManagedDevices.Read.All
-    - IdentityRiskyUser.Read.All
-    - Policy.Read.All
-
 - Admin consent must be granted for the above permissions.
 
 - Required credentials:
@@ -106,7 +103,7 @@ $clientId     = Read-Host "  Client ID (Application)"
 $clientSecret = Read-Host "  Client Secret" -AsSecureString
 
 $nombreCliente = Read-Host "  Nombre del Cliente"
-$autorInforme  = "Ismael Morilla Orellana "
+$autorInforme  = "Ismael Morilla Orellana"
 $anioCreacion  = "Abril - 2026"
 $logoCliente   = Read-Host "  URL Logo Cliente (Enter para logo generico)"
 if ([string]::IsNullOrWhiteSpace($logoCliente)) {
@@ -279,22 +276,20 @@ Write-Host "  Calculando KPIs..." -ForegroundColor Yellow
 function Test-IsMacDevice {
     param($Device)
 
-    $os = [string]$Device.operatingSystem
-    $manufacturer = [string]$Device.manufacturer
-    $model = [string]$Device.model
+    $os           = [string]$Device.operatingSystem
 
     return (
-        $os -match "(?i)mac|osx|os x|apple" -or
-        $manufacturer -match "(?i)apple" -or
-        $model -match "(?i)macbook|imac|mac mini|mac pro"
+        $os           -match "(?i)^macOS"
     )
 }
 
-$allIntune     = $intuneDevices
-$winDevices    = $allIntune | Where-Object { $_.operatingSystem -match "Windows" }
-$androidDevices= $allIntune | Where-Object { $_.operatingSystem -match "Android" }
-$iosDevices    = $allIntune | Where-Object { $_.operatingSystem -match "iOS" }
-$macDevices    = $allIntune | Where-Object { Test-IsMacDevice -Device $_ }
+$allIntune = $intuneDevices
+# Garantizar que un dispositivo macOS no sea clasificado también como Windows/Android/iOS
+# Graph API devuelve operatingSystem="macOS" con mayúsculas variables según el agente
+$winDevices     = $allIntune | Where-Object { $_.operatingSystem -match "(?i)^windows" }
+$androidDevices = $allIntune | Where-Object { $_.operatingSystem -match "(?i)^android" }
+$iosDevices     = $allIntune | Where-Object { $_.operatingSystem -match "(?i)^ios|^ipad" }
+$macDevices     = $allIntune | Where-Object { Test-IsMacDevice -Device $_ }
 
 $cntWin     = @($winDevices).Count
 $cntAndroid = @($androidDevices).Count
@@ -341,6 +336,26 @@ $cntCAPol_En= 0
 # ==============================
 # (NullSafe ya definida al inicio del script)
 
+# Convierte cualquier valor de fecha a string ISO 8601 (yyyy-MM-ddTHH:mm:ssZ).
+# Devuelve "" si el valor es nulo, vacío o la fecha nula de Graph (0001-01-01).
+# Necesario porque [string]$DateTime usa el locale del sistema (ej: "01/01/0001 0:00:00")
+# lo que rompe new Date() en JavaScript.
+function IsoDate {
+    param($Value)
+    if ($null -eq $Value) { return "" }
+    $s = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($s)) { return "" }
+    try {
+        $dt = [datetime]::Parse($s, [System.Globalization.CultureInfo]::InvariantCulture,
+                                 [System.Globalization.DateTimeStyles]::RoundtripKind)
+        # Fecha nula que devuelve Graph cuando no hay valor real
+        if ($dt.Year -le 1) { return "" }
+        return $dt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    } catch {
+        return ""
+    }
+}
+
 function ConvertTo-SafeJson {
     param($Data)
     if ($null -eq $Data -or $Data.Count -eq 0) { return "[]" }
@@ -353,11 +368,11 @@ function ConvertTo-SafeJson {
             operatingSystem   = NullSafe $item.operatingSystem
             osVersion         = NullSafe $item.osVersion
             complianceState   = $compliance
-            lastSyncDateTime  = NullSafe $item.lastSyncDateTime
-            manufacturer      = NullSafe $item.manufacturer
-            model             = NullSafe $item.model
-            serialNumber      = NullSafe $item.serialNumber
-            enrolledDateTime       = NullSafe $item.enrolledDateTime
+            lastSyncDateTime       = IsoDate  $item.lastSyncDateTime
+            manufacturer           = NullSafe $item.manufacturer
+            model                  = NullSafe $item.model
+            serialNumber           = NullSafe $item.serialNumber
+            enrolledDateTime       = IsoDate  $item.enrolledDateTime
             managementAgent        = NullSafe $item.managementAgent
             managedDeviceOwnerType = NullSafe $item.managedDeviceOwnerType
         }
@@ -379,11 +394,11 @@ function ConvertTo-SafeJsonEntra {
             trustType            = NullSafe $item.trustType
             mdmAppId             = NullSafe $item.mdmAppId
             managementType       = NullSafe $item.managementType
-            registrationDateTime = NullSafe $item.registrationDateTime
+            registrationDateTime = IsoDate  $item.registrationDateTime
             deviceId             = NullSafe $item.deviceId
             isCompliant          = $compliant
             isManaged            = $managed
-            lastSignIn           = NullSafe $item.approximateLastSignInDateTime
+            lastSignIn           = IsoDate  $item.approximateLastSignInDateTime
         }
     }
     return (ConvertTo-Json -InputObject @($arr) -Depth 3 -Compress)
@@ -445,19 +460,15 @@ $jsonWin     = ConvertTo-SafeJson -Data $winDevices
 $jsonAndroid = ConvertTo-SafeJson -Data $androidDevices
 $jsoniOS     = ConvertTo-SafeJson -Data $iosDevices
 $jsonMac     = ConvertTo-SafeJson -Data $macDevices
+$jsonAllIntune = ConvertTo-SafeJson -Data $intuneDevices
 $jsonEntra   = ConvertTo-SafeJsonEntra  -Data $entraDevices
 $jsonRisky   = "[]"
 $jsonCA      = "[]"
 $jsonCompliancePolicies = "[]"
 
-# IDs y nombres de dispositivos Intune para cruce con Entra (filtro huerfanos)
-$allIntune = [System.Collections.Generic.List[PSObject]]::new()
-foreach ($d in $winDevices)     { $allIntune.Add($d) }
-foreach ($d in $androidDevices) { $allIntune.Add($d) }
-foreach ($d in $iosDevices)     { $allIntune.Add($d) }
-foreach ($d in $macDevices)     { $allIntune.Add($d) }
-$intuneIdList = @($allIntune | Where-Object { $_.id } | ForEach-Object { '"' + $_.id.ToLower() + '"' }) -join ","
-$intuneNameList = @($allIntune | Where-Object { $_.deviceName } | ForEach-Object { '"' + $_.deviceName.ToLower() + '"' }) -join ","
+# IDs y nombres de dispositivos Intune para cruce con Entra (todos los dispositivos, sin filtro de plataforma)
+$intuneIdList = @($intuneDevices | Where-Object { $_.id } | ForEach-Object { '"' + $_.id.ToLower() + '"' }) -join ","
+$intuneNameList = @($intuneDevices | Where-Object { $_.deviceName } | ForEach-Object { '"' + $_.deviceName.ToLower() + '"' }) -join ","
 $jsonIntuneIds   = "[$intuneIdList]"
 $jsonIntuneNames = "[$intuneNameList]"
 
@@ -1599,7 +1610,7 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); font
   
   <!-- IZQUIERDA -->
   <div style="flex:1; display:flex; flex-direction:column; gap:2px;">
-    <div class="footer-text">Analisis parque informatico &#x2022; $nombreCliente &#x2022; Assessment actualizado: $fechaReporte</div>
+    <div class="footer-text">Auditoria de dispositivos v1.5 &#x2022; $nombreCliente &#x2022; $fechaReporte</div>
     <div class="footer-text" style="color:var(--blue);">Elaborado por: $autorInforme &#x2022; $anioCreacion</div>
   </div>
 
@@ -1630,6 +1641,7 @@ const DATA = {
   android: ensureArray($jsonAndroid),
   ios:     ensureArray($jsoniOS),
   macos:   ensureArray($jsonMac),
+  all:     ensureArray($jsonAllIntune),
   entra:   ensureArray($jsonEntra)
 };
 // Sets de IDs y nombres Intune para cruce rapido O(1) en filtro huerfanos
@@ -1815,28 +1827,34 @@ function closePanel() {
 }
 
 // ---- HELPERS ENTRA ----
-var SIX_MONTHS_MS  = 6  * 30 * 24 * 3600 * 1000;
-var THREE_MONTHS_MS = 3 * 30 * 24 * 3600 * 1000;
+// Umbrales calculados con meses calendario reales (no dias fijos)
+// para evitar el efecto de borde (ej: 89 dias = 2 meses 29 dias, NO 3 meses)
+function addCalendarMonths(date, months) {
+  var d = new Date(date);
+  d.setMonth(d.getMonth() - months);
+  return d;
+}
+var _now = new Date();
+var SIX_MONTHS_MS   = _now - addCalendarMonths(_now, 6);   // ms exactos de 6 meses naturales
+var THREE_MONTHS_MS = _now - addCalendarMonths(_now, 3);   // ms exactos de 3 meses naturales
 
 function isO365Mobile(d) {
   // MDM AppId de Office 365 Mobile: 7add3ecd-5b01-452e-b4bf-cdaf9df1d097
   return (d.mdmAppId || '').toLowerCase().indexOf('7add3ecd') >= 0;
 }
 function isHuerfano(d) {
-  // Replica exacta del filtro PowerShell:
-  //   - Windows (no Server)
-  //   - registrationDateTime == null (sin fecha de registro)
-  //   - managementType != MicrosoftSense
-  //   - No existe en Intune por deviceId NI por displayName
-  var isWindows  = /windows/i.test(d.operatingSystem || '');
-  var isServer   = /server/i.test(d.operatingSystem || '');
-  var noRegDate  = !d.registrationDateTime || d.registrationDateTime === '';
+  // Dispositivos HAADJ (ServerAd) sin ninguna traza de gestión ni actividad:
+  //   - trustType === 'ServerAd'  (unido a dominio híbrido)
+  //   - Sin registrationDateTime  (nunca completaron registro en Entra)
+  //   - Sin approximateLastSignInDateTime  (sin actividad conocida)
+  //   - managementType != MicrosoftSense  (no gestionado por Defender/MDE)
+  //   - Sin mdmAppId  (no gestionado por MDM)
+  var isHAADJ    = d.trustType === 'ServerAd';
+  var noRegDate  = !d.registrationDateTime  || d.registrationDateTime  === '';
+  var noActivity = !d.lastSignIn            || d.lastSignIn            === '';
   var notSense   = (d.managementType || '').toLowerCase() !== 'microsoftsense';
-  var notInIntune = (
-    (!d.deviceId   || !INTUNE_IDS.has(String(d.deviceId).toLowerCase())) &&
-    (!d.displayName || !INTUNE_NAMES.has(String(d.displayName).toLowerCase()))
-  );
-  return isWindows && !isServer && noRegDate && notSense && notInIntune;
+  var noMdm      = !d.mdmAppId || d.mdmAppId === '';
+  return isHAADJ && noRegDate && noActivity && notSense && noMdm;
 }
 function isRegisteredSinMdm(d) {
   var isWork   = d.trustType === 'Workplace';
@@ -1863,12 +1881,14 @@ function isRegisteredMdm(d) {
 function isCorreccionIdentidad(d) {
   // Dispositivos con propietario MDM registrado (isManaged=true) Y sin fecha de registro
   // Excluye Office365Mobile y MicrosoftSense
+  // Solo Windows
   var hasOwner  = d.isManaged === true;
   var hasMdm    = d.mdmAppId && d.mdmAppId !== '';
+  var isWindows = /windows/i.test(d.operatingSystem || '');
   var noReg     = !d.registrationDateTime || d.registrationDateTime === '';
   var notSense  = (d.managementType || '').toLowerCase() !== 'microsoftsense';
   var notO365   = !isO365Mobile(d);
-  return (hasOwner || hasMdm) && noReg && notSense && notO365;
+  return (hasOwner || hasMdm) && noReg && notSense && notO365 && isWindows;
 }
 
 // Precalculo de duplicados Entra por displayName
@@ -2032,11 +2052,18 @@ var intuneStaleFilt = [];
 var intuneStalePageN = 1;
 
 function initIntuneStale() {
-  var all = [].concat(DATA.windows||[], DATA.android||[], DATA.ios||[], DATA.macos||[]);
-  var now = Date.now();
+  // DATA.all contiene todos los dispositivos Intune sin filtro de plataforma,
+  // evitando que equipos con OS no clasificado (ej: ChromeOS, Linux, OS vacío) queden fuera
+  var all = DATA.all || [].concat(DATA.windows||[], DATA.android||[], DATA.ios||[], DATA.macos||[]);
+  var now = new Date();
+  // Umbral: usar meses calendario reales (no dias fijos) para evitar el efecto de borde
+  var cutoff = new Date(now);
+  cutoff.setMonth(cutoff.getMonth() - 3);
+  var cutoffMs = cutoff.getTime();
+
   intuneStaleAll = all.filter(function(d) {
     if (!d.lastSyncDateTime || d.lastSyncDateTime === '') return true;
-    return (now - new Date(d.lastSyncDateTime).getTime()) > THREE_MONTHS_MS;
+    return new Date(d.lastSyncDateTime).getTime() < cutoffMs;
   }).sort(function(a, b) {
     var ta = a.lastSyncDateTime ? new Date(a.lastSyncDateTime).getTime() : 0;
     var tb = b.lastSyncDateTime ? new Date(b.lastSyncDateTime).getTime() : 0;
@@ -2044,8 +2071,8 @@ function initIntuneStale() {
   });
 
   var cnt = intuneStaleAll.length;
-  document.getElementById('intuneStaleCount').textContent   = cnt;
-  document.getElementById('intuneStaleSubtitle').textContent = 'sin sincronizar en mas de 90 dias';
+  document.getElementById('intuneStaleCount').textContent    = cnt;
+  document.getElementById('intuneStaleSubtitle').textContent = 'sin sincronizacion en mas de 90 dias';
   document.getElementById('intuneStaleBadge').textContent    = cnt + ' dispositivos';
 }
 
@@ -2237,7 +2264,7 @@ function copyReport() {
 var DONUT_COLORS = ['#63b3ed','#68d391','#a78bfa','#f6ad55','#fc8181','#4fd1c5','#f687b3','#fbd38d','#90cdf4','#b794f4'];
 var CIRC = 2 * Math.PI * 42; // circunferencia r=42
 
-function buildDonut(svgId, legendId, tagId, totalId, groups, labelKey, countKey) {
+function buildDonut(svgId, legendId, tagId, totalId, groups, labelKey, countKey, onClickFn) {
   var svg = document.getElementById(svgId);
   var legend = document.getElementById(legendId);
 
@@ -2278,10 +2305,14 @@ function buildDonut(svgId, legendId, tagId, totalId, groups, labelKey, countKey)
     svg.insertBefore(circle, svg.querySelector('text'));
     offset += dash;
     var pctLbl = total > 0 ? Math.round(pct * 100) : 0;
-    legendHtml += '<div class="legend-row">' +
+    // Si hay handler de clic, hacer la fila interactiva
+    var clickAttr = onClickFn ? 'onclick="' + onClickFn + '(this, \'' + (g[labelKey] + '').replace(/\\/g, '\\\\').replace(/'/g, "\\'") + '\')" style="cursor:pointer;" onmouseover="this.style.background=\'rgba(99,179,237,0.06)\'" onmouseout="this.style.background=\'\'"' : '';
+    legendHtml += '<div class="legend-row" ' + clickAttr + '>' +
       '<div class="legend-left"><span class="legend-dot" style="background:' + color + '"></span>' +
-      '<span style="max-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="' + g[labelKey] + '">' + g[labelKey] + '</span></div>' +
-      '<div><span class="legend-count">' + g[countKey] + '</span><span class="legend-pct"> ' + pctLbl + '%</span></div>' +
+      '<span style="max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="' + g[labelKey] + '">' + g[labelKey] + '</span></div>' +
+      '<div><span class="legend-count">' + g[countKey] + '</span><span class="legend-pct"> ' + pctLbl + '%</span>' +
+      (onClickFn ? '<span style="font-family:var(--mono);font-size:9px;color:var(--blue);margin-left:6px;">Ver &rsaquo;</span>' : '') +
+      '</div>' +
       '</div>';
   });
   legend.innerHTML = legendHtml || '<span style="font-family:var(--mono);font-size:11px;color:var(--muted)">Sin datos</span>';
@@ -2310,7 +2341,11 @@ var VER_PLAT_MAP = {
   macos:   /mac/i
 };
 
+// Estado del filtro de plataforma activo para el donut de versiones
+var _verDonutPlatKey = 'all';
+
 function buildVerDonut(platKey) {
+  _verDonutPlatKey = platKey;
   var devs = DATA.entra;
   if (platKey !== 'all' && VER_PLAT_MAP[platKey]) {
     var re = VER_PLAT_MAP[platKey];
@@ -2323,16 +2358,61 @@ function buildVerDonut(platKey) {
   });
   var verGroups = Object.keys(verMap).map(function(k) { return { name: k, cnt: verMap[k] }; });
   verGroups.sort(function(a, b) { return b.cnt - a.cnt; });
+  // Limitar a 8 + Otros pero guardar todos para poder filtrar al hacer clic
   if (verGroups.length > 8) {
     var otros = verGroups.slice(8).reduce(function(s, g) { return s + g.cnt; }, 0);
     verGroups = verGroups.slice(0, 8);
     if (otros > 0) verGroups.push({ name: 'Otros', cnt: otros });
   }
-  buildDonut('entraDonutVer', 'entraLegendVer', 'entraDonutVerTag', 'entraDonutVerTotal', verGroups, 'name', 'cnt');
+  // Pasar 'onVerLegendClick' como handler para hacer las leyendas clicables
+  buildDonut('entraDonutVer', 'entraLegendVer', 'entraDonutVerTag', 'entraDonutVerTotal', verGroups, 'name', 'cnt', 'onVerLegendClick');
+}
+
+// Handler al hacer clic en una version del donut
+function onVerLegendClick(rowEl, verName) {
+  // Filtrar DATA.entra por plataforma activa + version seleccionada
+  var devs = DATA.entra;
+  if (_verDonutPlatKey !== 'all' && VER_PLAT_MAP[_verDonutPlatKey]) {
+    var re = VER_PLAT_MAP[_verDonutPlatKey];
+    devs = devs.filter(function(d) { return re.test(d.operatingSystem || ''); });
+  }
+
+  var filtered;
+  if (verName === 'Otros') {
+    // "Otros" = versiones que no estan en el top 8 mostradas
+    var topVers = [];
+    var allVerGroups = Object.keys(
+      devs.reduce(function(m, d) { var v=(d.osVersion||'Desconocida').trim(); m[v]=(m[v]||0)+1; return m; }, {})
+    ).map(function(k) { return k; });
+    allVerGroups.sort(function(a,b){ return (devs.filter(function(d){return (d.osVersion||'Desconocida').trim()===b;}).length) - (devs.filter(function(d){return (d.osVersion||'Desconocida').trim()===a;}).length); });
+    topVers = allVerGroups.slice(0, 8);
+    filtered = devs.filter(function(d) { return topVers.indexOf((d.osVersion||'Desconocida').trim()) === -1; });
+  } else {
+    filtered = devs.filter(function(d) { return (d.osVersion || 'Desconocida').trim() === verName; });
+  }
+
+  // Construir titulo
+  var platLabel = _verDonutPlatKey === 'all' ? 'Todos' : _verDonutPlatKey;
+  var title = 'Version: ' + verName + ' (' + platLabel + ')';
+
+  currentEntraData = filtered;
+  entraActivePlatFilter = _verDonutPlatKey;
+  entraShowDaysCol = false;
+  document.getElementById('entraDevTitle').textContent  = title;
+  document.getElementById('entraDevCount').textContent  = filtered.length + ' dispositivos';
+  document.getElementById('searchEntra').value = '';
+  // Sincronizar botones de plataforma del panel
+  document.querySelectorAll('#entraFilterPlatBtns .ver-plat-btn').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.plat === _verDonutPlatKey);
+  });
+  updateEntraView(filtered);
+  var panel = document.getElementById('entraDevPanel');
+  panel.style.display = 'block';
+  setTimeout(function() { panel.scrollIntoView({ behavior:'smooth', block:'start' }); }, 50);
 }
 
 function selectVerPlat(btn, platKey) {
-  document.querySelectorAll('.ver-plat-btn').forEach(function(b) { b.classList.remove('active'); });
+  document.querySelectorAll('#verPlatBtns .ver-plat-btn').forEach(function(b) { b.classList.remove('active'); });
   btn.classList.add('active');
   buildVerDonut(platKey);
 }
@@ -2433,30 +2513,44 @@ function classifyDevice(d) {
 // managementAgent values: mdm, easMdm, configurationManagerClientMdm,
 // configurationManagerClient, jamf, googleCloudDevicePolicyController, msSense, etc.
 var MGMT_GROUPS = [
-  { key: 'mdm',      label: 'Intune',       color: '#63b3ed',
+  { key: 'mdm',      label: 'Intune (MDM)',                color: '#63b3ed',
     match: function(a) { return a === 'mdm' || a === 'easmdm' || a === 'easMdm'; } },
-  { key: 'sccm',     label: 'Co-management (SCCM+MDM)', color: '#f6ad55',
+  { key: 'sccm',     label: 'Co-management (SCCM+MDM)',    color: '#f6ad55',
     match: function(a) { return a === 'configurationManagerClientMdm' || a === 'configurationManagerClientMdmEas'; } },
-  { key: 'sccmonly', label: 'SCCM / ConfigMgr solo',   color: '#fc8181',
+  { key: 'sccmonly', label: 'SCCM / ConfigMgr solo',      color: '#fc8181',
     match: function(a) { return a === 'configurationManagerClient'; } },
-  { key: 'mde',      label: 'MDE',       color: '#a78bfa',
+  { key: 'mde',      label: 'Defender (MDE)',              color: '#a78bfa',
     match: function(a) { return a === 'msSense'; } },
-  { key: 'jamf',     label: 'Jamf',                    color: '#4fd1c5',
+  { key: 'jamf',     label: 'Jamf',                       color: '#4fd1c5',
     match: function(a) { return a === 'jamf'; } },
   { key: 'gcp',      label: 'Android Enterprise (Intune)', color: '#68d391',
     match: function(a) { return a === 'googleCloudDevicePolicyController'; } },
-  { key: 'other',    label: 'Otro / Desconocido',       color: '#64748b',
+  { key: 'eas',      label: 'Exchange ActiveSync',         color: '#f687b3',
+    match: function(a) { return a === 'eas'; } },
+  { key: 'other',    label: 'Otro / Desconocido',          color: '#64748b',
     match: function(a) { return true; } } // catch-all
 ];
 
-var MGMT_DISPLAY = [
-  { key: 'mde',  label: 'Defender (MDE)', color: '#a78bfa',
-    match: function(a) { return a === 'msSense'; } },
-  { key: 'mdm',  label: 'Intune (MDM)',   color: '#63b3ed',
-    match: function(a) { return a === 'mdm' || a === 'easMdm' || a === 'easmdm'; } },
-  { key: 'gcp',  label: 'Android Enterprise', color: '#68d391',
-    match: function(a) { return a === 'googleCloudDevicePolicyController'; } }
-];
+// MGMT_DISPLAY: se construye dinamicamente a partir de los agentes presentes en los datos
+// en lugar de ser una lista fija. Asi aparecen todos los tipos reales del tenant.
+var MGMT_DISPLAY = (function() {
+  var allDevices = [].concat(DATA.windows||[], DATA.android||[], DATA.ios||[], DATA.macos||[]);
+  var seen = {};
+  allDevices.forEach(function(d) {
+    var agent = (d.managementAgent || '').trim();
+    for (var i = 0; i < MGMT_GROUPS.length - 1; i++) {  // excluir catch-all 'other'
+      if (MGMT_GROUPS[i].match(agent)) {
+        seen[MGMT_GROUPS[i].key] = true;
+        break;
+      }
+    }
+    // Si no coincide con ningun grupo conocido, registrar como 'other'
+    var matched = MGMT_GROUPS.slice(0, -1).some(function(g) { return g.match(agent); });
+    if (!matched && agent !== '') seen['other'] = true;
+  });
+  // Devolver solo los grupos que esten presentes, en el orden definido en MGMT_GROUPS
+  return MGMT_GROUPS.filter(function(g) { return seen[g.key]; });
+})();
 
 function getMgmtGroup(agent) {
   var a = (agent || '').trim();
@@ -2974,12 +3068,16 @@ var OWNER_COLORS = { company: 'var(--blue)', personal: 'var(--orange)', unknown:
 function showOwnerPanel(ownerType) {
   var allDevices = [].concat(
     DATA.windows || [], DATA.android || [], DATA.ios || [], DATA.macos || []
-  ).filter(function(d) { return !isSystemUpn(d.userPrincipalName); });
+  );
 
+  // Para 'company' y 'personal' excluimos UPNs de sistema (cuentas de servicio, etc.)
+  // Para 'unknown' NO filtramos por UPN: muchos dispositivos sin propietario asignado
+  // tienen UPN vacío de forma legítima (ej: iPhones pre-enrolled, kioscos, salas)
   var filtered = allDevices.filter(function(d) {
     var t = (d.managedDeviceOwnerType || '').toLowerCase();
-    if (ownerType === 'company')  return t === 'company';
-    if (ownerType === 'personal') return t === 'personal';
+    if (ownerType === 'company')  return t === 'company'  && !isSystemUpn(d.userPrincipalName);
+    if (ownerType === 'personal') return t === 'personal' && !isSystemUpn(d.userPrincipalName);
+    // unknown: todos los que no son company ni personal, sin filtro de UPN
     return t !== 'company' && t !== 'personal';
   });
 
@@ -3133,6 +3231,7 @@ $html = $html.Replace('$jsonAndroid', $jsonAndroid)
 $html = $html.Replace('$jsoniOS',     $jsoniOS)
 $html = $html.Replace('$jsonMac',     $jsonMac)
 $html = $html.Replace('$jsonEntra',      $jsonEntra)
+$html = $html.Replace('$jsonAllIntune',  $jsonAllIntune)
 $html = $html.Replace('$jsonIntuneIds',   $jsonIntuneIds)
 $html = $html.Replace('$jsonIntuneNames', $jsonIntuneNames)
 $html = $html.Replace('$autorInforme',    $autorInforme)
