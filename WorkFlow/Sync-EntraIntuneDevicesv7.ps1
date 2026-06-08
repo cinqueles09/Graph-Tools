@@ -29,7 +29,7 @@
     Secreto de cliente generado para el App Registration (SecureString).
 
 .NOTES
-    Autor:         Ismael Morilla / ST05
+    Autor:         Ismael Morilla
     Fecha:         2025-12-23
     Version:       7.0
     Requisitos:    App Registration en Azure con permisos de Aplicacion:
